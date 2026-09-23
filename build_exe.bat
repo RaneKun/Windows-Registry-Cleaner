@@ -34,7 +34,7 @@ python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python is not installed, or not on PATH.
     echo.
-    echo         Install Python 3.11 or newer (64-bit) from https://www.python.org/
+    echo         Install Python 3.11 or newer ^(64-bit^) from https://www.python.org/
     echo         During installation, make sure "Add Python to PATH" is checked.
     echo.
     popd
@@ -61,7 +61,7 @@ for /f "tokens=1,2 delims=." %%a in ("!PYVER!") do (
     set "PYMINOR=%%b"
 )
 
-echo !PYMAJOR!| findstr /r "^[0-9][0-9]*$" >nul
+echo(!PYMAJOR!| findstr /r "^[0-9][0-9]*$" >nul
 if errorlevel 1 (
     echo [ERROR] Could not parse Python version from: !PYVER!
     echo.
@@ -86,14 +86,34 @@ if "!PYVER_OK!"=="0" (
 
 REM Refuse 32-bit Python on 64-bit Windows (filesystem redirection would
 REM produce false "missing file" results in the built app).
+REM
+REM We use a temp file instead of `for /f 'python -c "..."'` because cmd's
+REM parser mangles nested double quotes inside a for /f command block.
 set "PY_ARCH="
-for /f "tokens=2 delims= " %%a in ('python -c "import struct; print(struct.calcsize('P')*8)" 2^>^&1') do set "PY_ARCH=%%a"
+set "PYARCH_TMP=%TEMP%\pyarch_%RANDOM%.tmp"
+python -c "import struct; print(struct.calcsize(chr(80))*8)" > "%PYARCH_TMP%" 2>nul
+if exist "%PYARCH_TMP%" (
+    set /p PY_ARCH=<"%PYARCH_TMP%"
+    del /q "%PYARCH_TMP%" >nul 2>&1
+)
+
+if not defined PY_ARCH (
+    echo [ERROR] Could not determine whether Python is 32-bit or 64-bit.
+    echo.
+    echo         Run this manually to check your installation:
+    echo             python -c "import struct; print(struct.calcsize('P')*8)"
+    echo.
+    popd
+    pause
+    exit /b 1
+)
+
 if "!PY_ARCH!"=="32" (
     echo [ERROR] This is 32-bit Python, but the app requires 64-bit Python
     echo         on 64-bit Windows.
     echo.
     echo         On 64-bit Windows, a 32-bit Python would see a redirected
-    echo         filesystem (System32 -^> SysWOW64) and could report working
+    echo         filesystem ^(System32 -^> SysWOW64^) and could report working
     echo         files as missing. Please install 64-bit Python.
     echo.
     popd
