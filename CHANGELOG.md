@@ -4,7 +4,7 @@ All notable changes to Windows Registry Cleaner will be documented in this file.
 
 ---
 
-## [v1.0.0] - 2026-09-23
+## [v1.0.0] - 2026-09-24
 
 ### 🎉 Initial Release
 
