@@ -19,7 +19,7 @@
 ---
 
 <p align="center">
-  <img src="https://via.placeholder.com/1142x528/1b1b22/46dcff?text=Windows+Registry+Cleaner" alt="Windows Registry Cleaner screenshot">
+<img width="1004" height="739" alt="Screenshot 2026-09-23 205953" src="https://github.com/user-attachments/assets/2a984853-12f4-420e-a194-3b74303b7abc" />
 </p>
 
 <p align="center"><em>Analyze → review → confirm. Every change gets its own undo file.</em></p>
@@ -119,7 +119,7 @@ Some antivirus software may flag the `.exe` as suspicious. **This is a false pos
 - **Managed-PC warnings** — if the PC looks domain-joined or Intune-managed, policy-lock repairs get an extra confirmation
 - **Restart as Administrator** — one click to relaunch elevated if you started without it
 - **Colour-matched to Windows** — uses your system accent colour for the UI
-- **Fully open source**
+- **Fully [open source](LICENSE.md)**
 
 ---
 
@@ -153,7 +153,7 @@ The build script handles everything — checking Python version, installing PyIn
 | **Analyze finds nothing** | That's expected on a healthy PC. The scanner is deliberately strict about what counts as "broken". |
 | **Some entries get skipped during cleaning** | Normal — files can be locked, or a path became reachable again between scan and clean. The log explains each skip. |
 | **WinSxS-style operations take a long time** | Backups of the whole registry take a few minutes. Let them run; Cancel is available if you need it. |
-| **Antivirus blocked the .exe** | False positive — see the "Note About Antivirus" section above. |
+| **Antivirus blocked the .exe** | False positive — see the "[Note About Antivirus](https://github.com/RaneKun/Windows-Registry-Cleaner/edit/main/README.md#a-note-about-antivirus)" section above. |
 | **Windows Defender "unknown publisher" warning** | Click "More info" → "Run anyway". The tool isn't code-signed (that costs money), but the source is public. |
 
 ---
