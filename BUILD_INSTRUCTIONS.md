@@ -66,6 +66,8 @@ Your Folder/
 
 No leftover `build` folder, no `dist` folder, no `.spec` file — the script cleans all of that up automatically.
 
+> **Tip:** When you run the built `.exe`, it will create two small files next to it the first time they are needed: `windows_registry_cleaner_settings.json` (remembers your backup folder) and `windows_registry_cleaner_exclusions.json` (the findings you chose to keep). Both are plain, human-readable files.
+
 ---
 
 ## ✅ Testing It
@@ -141,6 +143,7 @@ If your antivirus complains:
 - **Test before sharing** — always run the `.exe` once yourself first
 - **Don't delete the source `.py` file** — you'll need it if you ever want to rebuild
 - **Close the old `.exe`** before rebuilding — otherwise the new one can't take its place
+- **Watch the safety banner on first run** — a red Safety Status means the built-in self-check failed and cleaning is disabled on purpose; try a rebuild in that case
 
 ---
 
