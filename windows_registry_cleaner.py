@@ -9,6 +9,7 @@ A small, single-purpose Windows tool that does four things and nothing else:
                choices (default-app selections, disabled startup items, policies).
                Remembered network locations in Explorer's history (which can freeze Explorer when
                a server is unreachable) are listed too, but start UNTICKED so you decide.
+               Findings you want to keep can be excluded: they stop being listed.
   2. BACKUP  - one-click backup of the whole registry to a folder of your choice
                (plain-text .reg files).
   3. RESTORE - restores a curated set of critical Windows defaults (policy locks,
@@ -28,12 +29,31 @@ SAFETY MODEL (every write operation follows these rules)
     an explicit choice that keeps the unverified undo file and deletes anyway.
     The Import tab's streamed undo file is verified entry by entry (a fingerprint of every
     entry written is compared with what is read back), not merely by counting entries.
+    Clean and Restore undo files get the same entry-by-entry check as a final gate, after
+    the value-by-value read-back: the file must exist, parse and match what was written.
   * Every deletion is re-validated immediately before it happens and is checked
     against a strict allow-list of registry locations (the scanner also drops any
     finding the allow-list would refuse, so such entries are never even listed).
-  * After a change, the finished box says whether a restart is advised (a heuristic
-    score per kind of change): routine cleaning of broken entries stays at "no restart
-    needed"; "Restart Now / Restart Later" appear only when a restart really helps.
+  * After a change, the tool decides whether to say anything about restarting - and the
+    default is nothing. A 3-tier impact classification (a weight per kind of change, see
+    "RESTART ADVICE") gives Tier 0 = no restart needed: no popup, no dialog, no banner;
+    Tier 1 = restart recommended: one optional, non-modal note with an OK button;
+    Tier 2 = strongly recommended: the "Restart Now / Restart Later" box. Routine cleaning
+    of broken entries stays in Tier 0, and a restart that Windows merely has pending
+    never produces a prompt on its own. Problems (skipped or failed entries) are always
+    reported, whatever the tier.
+  * Exclusions ("Add to Exclusions") only HIDE findings. They are applied to the finished
+    scan result - never inside the scanner, the allow-list, the re-validation or the clean
+    engine, which behave exactly as if the feature did not exist. The list is kept in a
+    human-readable, versioned, checksummed file; if it cannot be loaded safely it is
+    ignored (nothing is hidden) and you are warned. A finding whose exclusion is removed
+    comes back unticked.
+  * At start-up a self-check RUNS the allow-list, the delete guards, the protected-path
+    list and the undo writer/reader on made-up data (and again right before every clean).
+    If a critical part fails, cleaning is disabled (fail closed). The safety banner at the
+    top shows what the check proved - its ticks are not hard-wired.
+  * Diagnostics (scan and cleanup duration, counts) go to the local log as numbers only:
+    no paths, no names, nothing leaves the PC.
   * Anything that cannot be verified (offline/removable/network drives, protected
     Windows folders, unresolved environment variables, unreadable paths) is skipped,
     never treated as "broken".
@@ -89,6 +109,8 @@ from __future__ import annotations
 import ctypes
 import datetime
 import getpass
+import hashlib
+import html
 import io
 import json
 import logging
@@ -107,18 +129,18 @@ import traceback
 import winreg
 from array import array
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Iterator
 
 # --- Third-party imports (GUI) ---
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QCloseEvent, QFont, QIcon
+from PyQt6.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCloseEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSplitter, QStackedWidget, QTabWidget, QTextBrowser,
+    QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 
@@ -133,6 +155,7 @@ APP_AUTHOR = "RaneKun"
 
 ICON_FILE_NAME = "windows_registry_cleaner.ico"            # optional, placed next to this script
 SETTINGS_FILE_NAME = "windows_registry_cleaner_settings.json"
+EXCLUSIONS_FILE_NAME = "windows_registry_cleaner_exclusions.json"   # findings the user chose to keep (hides them, nothing more)
 ERROR_LOG_FILE_NAME = "error-log 📃.txt"                    # same name the other tools use
 LOG_FOLDER_NAME = "Windows Registry Cleaner by Rane Logs"   # created under the OS temp folder
 DEFAULT_BACKUP_FOLDER_NAME = "Registry Backups"
@@ -156,34 +179,64 @@ SUBPROCESS_POLL_SECONDS = 0.2         # how often a running reg.exe is checked f
 REPORT_MIN_INTERVAL_SECONDS = 0.1     # routine progress updates are limited to ~10 per second (huge jobs would flood the UI and log)
 UNDO_FAILURES_BEFORE_OVERRIDE = 3     # the SAME entry must fail the undo safety check this many times before "Continue anyway (risky!)" is offered
 MAX_LOGGED_UNDO_PROBLEMS = 100        # individual undo-check problems written to the log per run (the rest are only counted)
-# Restart advice: how much each kind of change needs a restart. These are HEURISTIC scores - tune them here.
-RESTART_SCORE_NONE = 0                # takes effect at once, or only matters the next time something is launched
-RESTART_SCORE_PROGRAMS = 1            # a program that is already running (e.g. Explorer) may keep the old value until restarted
-RESTART_SCORE_SHELL = 3               # read once at sign-in: restart (or sign out and back in) recommended
-RESTART_SCORE_BOOT = 7                # only read while Windows starts (services, drivers, boot/session settings)
-RESTART_RECOMMENDED_AT = 3            # total score from which a restart is "recommended"
-RESTART_STRONG_AT = 7                 # total score from which it is "strongly recommended"
+# Restart advice = a 3-tier impact classification (see "RESTART ADVICE" below). Every kind of change has a WEIGHT; every
+# deleted entry adds the weight of its kind, the points add up, and the total decides the tier. These are HEURISTIC
+# starting values - tune them here.
+RESTART_WEIGHT_NONE = 0               # bookkeeping nobody reads while it runs: SharedDLL counts, Uninstall entries, network history, program-name cache
+RESTART_WEIGHT_LOW = 1                # something a running program may already have loaded: file associations, startup entries, application paths, fonts
+RESTART_WEIGHT_SHELL = 2              # right-click menu handlers (Explorer loads these into running programs)
+RESTART_TIER1_AT = 50                 # points from which a restart is "recommended" (Tier 1: one optional note, nothing is asked)
+                                      # (10x the first suggestion of 5 / 16: with one point PER DELETED ENTRY, 5 and 16 would put an ordinary
+                                      #  cleanup of 16 stale file associations into Tier 2 - the opposite of "almost never")
+RESTART_TIER2_AT = 160                # points from which it is "strongly recommended" (Tier 2: Restart Now / Restart Later)
+# Restore/Import count each KIND of change once. Sized to keep the long-standing meaning of their advice: ONE setting that Windows
+# reads only at sign-in is a Tier 1 reason by itself, two are still Tier 1, three together reach Tier 2; a setting that is read only
+# while Windows starts (services, drivers, boot) is a Tier 2 reason by itself.
+RESTART_SIGN_IN_POINTS = max(RESTART_TIER1_AT, -(-RESTART_TIER2_AT // 3))
+RESTART_BOOT_POINTS = RESTART_TIER2_AT
+RESTART_PENDING_MIN_POINTS = RESTART_TIER1_AT // 2   # a restart Windows ALREADY has pending raises the tier by one - but only for a change at least this big
 RESTART_DELAY_SECONDS = 30            # "Restart Now" restarts after this countdown, so it can still be cancelled with "shutdown /a"
 RESTART_COMMENT = "Restart requested by Windows Registry Cleaner by Rane to finish applying registry changes."
 CREATE_NO_WINDOW_FLAG = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # hides the console window on Windows
+MAX_EXCLUSIONS = 20000                # a larger exclusions file is treated as damaged (it can only hide findings, never delete anything)
+PREVIEW_MAX_VALUE_LINES = 12          # values listed in the 'current registry entry' preview before it says '... and N more'
+PREVIEW_MAX_SUBKEY_LINES = 6          # subkeys named in that preview
+PREVIEW_TREE_KEY_LIMIT = 400          # the preview counts the keys below a finding only up to this many (then it says 'at least')
+IMPACT_TREE_KEY_LIMIT = 3000          # the pre-clean summary counts the keys below all selected findings only up to this many ...
+IMPACT_TIME_BUDGET_SECONDS = 1.5      # ... or for this long, whichever comes first (the window must not freeze while it counts)
 
 # =============================================================================
 # CONSTANTS - user interface (all colors, fonts and sizes live here)
 # =============================================================================
 
-UI_FONT_FAMILY = "Comic Sans MS"      # same font as the other Rane tools
+UI_FONT_FAMILY = "Comic Sans MS"      # same font as the other Rane tools (a Windows-native look: try "Segoe UI Variable" or "Segoe UI")
 UI_FONT_POINT_SIZE = 9
+UI_FONT_SIZE_TITLE = 11               # card titles and empty-state headings
+UI_FONT_SIZE_STAT = 14                # the numbers of the statistics bar
+UI_FONT_SIZE_CAPTION = 8              # small captions and hints
 UI_MONO_FONT_FAMILY = "Consolas"
 UI_WINDOW_MARGIN = 12
 UI_LAYOUT_SPACING = 8
+UI_CARD_RADIUS = 8                    # rounded corners of cards, the safety banner and the tab pane
+UI_CARD_PADDING = 10
 UI_RESULTS_MIN_WIDTH = 900
 UI_RESULTS_MIN_HEIGHT = 280
+UI_CLEAN_RESULTS_MIN_HEIGHT = 130     # the Clean results list can be shorter: the window is resizable and the review panel shares the space
+UI_DETAILS_MIN_HEIGHT = 72
+UI_CLEAN_LIST_START_HEIGHT = 240      # the results list starts this tall, the review panel below it this tall (drag the divider to change)
+UI_DETAILS_START_HEIGHT = 100
+UI_SCROLL_PAGE_MIN_WIDTH = 480        # a scrolling tab page may be shown this small (it scrolls); other tabs set the window's real minimum
+UI_SCROLL_PAGE_MIN_HEIGHT = 200
 UI_PREVIEW_MIN_HEIGHT = 200
 UI_FILE_LIST_MIN_HEIGHT = 110
 UI_CATEGORY_COLUMNS = 3             # columns of scan-category checkboxes (3 keeps the window short on laptop screens)
+UI_SCREEN_FRACTION = 0.94           # the window never opens larger than this share of the usable screen
 # Result-column widths are given in "average characters" and converted with the actual font at start-up, so the
 # layout adapts to Comic Sans MS (which is wider than most fonts) instead of clipping text.
-UI_COLUMN_PROBLEM_CHARS = 56        # 'Problem' column of the Clean results
+UI_COLUMN_STATUS_CHARS = 24         # 'Status' column of the Clean results (wide: the tree's indentation and the tick box sit inside it)
+UI_COLUMN_CATEGORY_CHARS = 17       # 'Category' column of the Clean results (icon + short name)
+UI_COLUMN_CONFIDENCE_CHARS = 27     # 'Confidence' column of the Clean results
+UI_COLUMN_DATE_CHARS = 20           # 'Date excluded' column of the Excluded Items list
 UI_COLUMN_REPAIR_CHARS = 44         # 'Repair' column of the Restore results
 UI_COLUMN_CURRENT_CHARS = 24        # 'Current value' column of the Restore results
 UI_COLUMN_RESTORED_CHARS = 34       # 'Restored value' column (the longest texts live here)
@@ -198,40 +251,91 @@ COLOR_ERROR = "#c0392b"
 COLOR_WARNING = "#b9770e"
 COLOR_SUCCESS = "#1e8449"
 COLOR_MUTED = "#6b6b6b"
+COLOR_INFO = "#2471a3"
 
 STYLESHEET = f"""
 QPushButton {{
-    padding: 5px 12px;
-    border: 1px solid palette(mid);
-    border-radius: 4px;
+    padding: 5px 14px;
+    border: 1px solid rgba(128, 128, 128, 120);
+    border-radius: 6px;
     background-color: palette(button);
 }}
 QPushButton:hover {{ border-color: palette(highlight); }}
+QPushButton:pressed {{ background-color: palette(midlight); }}
 QPushButton:disabled {{ color: palette(mid); }}
-QPushButton#primaryButton {{
+QPushButton#primaryButton, QPushButton[primary="true"] {{
     background-color: palette(highlight);
     color: palette(highlighted-text);
     border: 1px solid palette(highlight);
     font-weight: bold;
 }}
-QPushButton#primaryButton:disabled {{
+QPushButton#primaryButton:disabled, QPushButton[primary="true"]:disabled {{
     background-color: palette(button);
     color: palette(mid);
-    border: 1px solid palette(mid);
+    border: 1px solid rgba(128, 128, 128, 120);
 }}
+QPushButton[workflow="true"] {{ font-weight: bold; }}
+QPushButton[danger="true"][primary="false"] {{ border: 1px solid {COLOR_ERROR}; color: {COLOR_ERROR}; }}
+QPushButton[danger="true"][primary="false"]:disabled {{ border: 1px solid rgba(128, 128, 128, 120); color: palette(mid); }}
 QPushButton#dangerButton {{ border: 1px solid {COLOR_ERROR}; color: {COLOR_ERROR}; font-weight: bold; }}
-QPushButton#dangerButton:disabled {{ border: 1px solid palette(mid); color: palette(mid); }}
+QPushButton#dangerButton:disabled {{ border: 1px solid rgba(128, 128, 128, 120); color: palette(mid); }}
+QPushButton#linkButton {{ border: none; background: transparent; padding: 2px 6px; text-align: left; font-weight: bold; }}
+QPushButton#linkButton:hover {{ color: palette(highlight); }}
+QToolButton#sectionToggle {{ border: none; background: transparent; padding: 4px 6px; font-weight: bold; }}
+QToolButton#sectionToggle:hover {{ color: palette(highlight); }}
 QGroupBox {{
     font-weight: bold;
-    margin-top: 10px;
-    border: 1px solid palette(mid);
-    border-radius: 4px;
+    margin-top: 12px;
+    border: 1px solid rgba(128, 128, 128, 80);
+    border-radius: {UI_CARD_RADIUS}px;
     padding: 8px;
 }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
-QTabWidget::pane {{ border: 1px solid palette(mid); border-radius: 4px; }}
-QProgressBar {{ border: 1px solid palette(mid); border-radius: 4px; text-align: center; }}
-QProgressBar::chunk {{ background-color: palette(highlight); }}
+QFrame#card {{
+    background-color: palette(base);
+    border: 1px solid rgba(128, 128, 128, 80);
+    border-radius: {UI_CARD_RADIUS}px;
+}}
+QLabel#cardTitle {{ font-size: {UI_FONT_SIZE_TITLE}pt; font-weight: bold; background: transparent; border: none; }}
+QLabel#cardHint {{ color: {COLOR_MUTED}; font-size: {UI_FONT_SIZE_CAPTION}pt; background: transparent; border: none; }}
+QLabel#statValue {{ font-size: {UI_FONT_SIZE_STAT}pt; font-weight: bold; background: transparent; border: none; }}
+QLabel#statCaption {{ color: {COLOR_MUTED}; font-size: {UI_FONT_SIZE_CAPTION}pt; background: transparent; border: none; }}
+QFrame#statDivider {{ background-color: rgba(128, 128, 128, 80); border: none; max-width: 1px; }}
+QLabel#cardValue {{ font-weight: bold; background: transparent; border: none; }}
+QLabel#cardValue[state="warn"] {{ color: {COLOR_WARNING}; }}
+QLabel#cardValue[state="bad"] {{ color: {COLOR_ERROR}; }}
+QLabel#cardValue[state="good"] {{ color: {COLOR_SUCCESS}; }}
+QFrame#safetyBanner {{
+    border: 1px solid rgba(30, 132, 73, 120);
+    border-radius: {UI_CARD_RADIUS}px;
+    background-color: rgba(30, 132, 73, 30);
+}}
+QFrame#safetyBanner[state="warn"] {{ border-color: rgba(185, 119, 14, 140); background-color: rgba(185, 119, 14, 34); }}
+QFrame#safetyBanner[state="bad"] {{ border-color: rgba(192, 57, 43, 150); background-color: rgba(192, 57, 43, 34); }}
+QLabel#safetyChip {{ font-weight: bold; color: {COLOR_SUCCESS}; background: transparent; border: none; }}
+QLabel#safetyChip[state="warn"] {{ color: {COLOR_WARNING}; }}
+QLabel#safetyChip[state="bad"] {{ color: {COLOR_ERROR}; }}
+QLabel#safetyStatus {{ font-weight: bold; color: {COLOR_SUCCESS}; background: transparent; border: none; }}
+QLabel#safetyStatus[state="warn"] {{ color: {COLOR_WARNING}; }}
+QLabel#safetyStatus[state="bad"] {{ color: {COLOR_ERROR}; }}
+QLabel#emptyIcon {{ font-size: 30pt; background: transparent; border: none; }}
+QLabel#emptyTitle {{ font-size: {UI_FONT_SIZE_TITLE}pt; font-weight: bold; background: transparent; border: none; }}
+QLabel#emptyText {{ color: {COLOR_MUTED}; background: transparent; border: none; }}
+QTabWidget::pane {{ border: 1px solid rgba(128, 128, 128, 80); border-radius: {UI_CARD_RADIUS}px; top: -1px; }}
+QTabBar::tab {{
+    padding: 6px 16px;
+    margin-right: 2px;
+    border: 1px solid transparent;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+}}
+QTabBar::tab:selected {{ background-color: palette(window); border: 1px solid rgba(128, 128, 128, 80); border-bottom-color: palette(window); font-weight: bold; }}
+QTabBar::tab:!selected:hover {{ background-color: rgba(128, 128, 128, 35); }}
+QTreeWidget, QListWidget, QPlainTextEdit, QTextBrowser {{ border: 1px solid rgba(128, 128, 128, 90); border-radius: 6px; }}
+QHeaderView::section {{ padding: 4px 8px; border: none; border-bottom: 1px solid rgba(128, 128, 128, 90); font-weight: bold; }}
+QLineEdit {{ border: 1px solid rgba(128, 128, 128, 90); border-radius: 6px; padding: 3px 6px; }}
+QProgressBar {{ border: 1px solid rgba(128, 128, 128, 90); border-radius: 6px; text-align: center; }}
+QProgressBar::chunk {{ background-color: palette(highlight); border-radius: 5px; }}
 QLabel#mutedLabel {{ color: {COLOR_MUTED}; }}
 QLabel#warningLabel {{ color: {COLOR_WARNING}; font-weight: bold; }}
 QLabel#successLabel {{ color: {COLOR_SUCCESS}; font-weight: bold; }}
@@ -2751,7 +2855,7 @@ class UndoPlan:
             RegistryOperationError: If the file cannot be written at all (same rule for the caller).
         """
         try:
-            with RegFileWriter(destination_path) as writer:
+            with RegFileWriter(destination_path, track_content=True) as writer:   # remembers what it wrote, for the entry-by-entry gate below
                 for action in self._actions:
                     action(writer)
         except OSError as error:
@@ -2775,6 +2879,19 @@ class UndoPlan:
                 f"by the user: {destination_path}")
             self._log_problems("[WARNING] Accepted undo problem", accepted)
         else:
+            # The strict value-by-value check above came back perfectly clean. Before cleaning may go on, ONE MORE independent
+            # gate: the file must exist, be non-empty, parse, and match what the writer meant to write entry by entry
+            # (fingerprints). It can only turn a pass into a failure - it never touches the "Continue anyway" handling above.
+            gate_problems = validate_undo_file(destination_path, writer)
+            if gate_problems:
+                try:
+                    os.remove(destination_path)
+                except OSError:
+                    pass
+                gate = [UndoProblem(message) for message in gate_problems]      # whole-file problems: they can never be "accepted"
+                self._log_problems("[WARNING] Undo check problem", gate)
+                shown = "; ".join(gate_problems[:3]) + (f"; and {len(gate_problems) - 3} more" if len(gate_problems) > 3 else "")
+                raise UndoVerificationError(f"The undo backup failed its safety check ({shown}). Nothing was changed.", gate)
             log(f"[UNDO] Verified undo file written: {destination_path}")
         return accepted
 
@@ -2791,6 +2908,29 @@ class UndoPlan:
             log(f"{prefix}: {problem.message}")
         if len(problems) > MAX_LOGGED_UNDO_PROBLEMS:
             log(f"{prefix}: ... and {len(problems) - MAX_LOGGED_UNDO_PROBLEMS} more (not listed)")
+
+
+def validate_undo_file(undo_path: str, writer: RegFileWriter) -> list[str]:
+    """
+    The final gate for a freshly written undo backup. FAILS CLOSED: any doubt is a problem.
+
+    The file must (1) exist and not be empty, (2) parse completely (an unreadable line is a problem), and (3) hold
+    exactly the entries the writer wrote - same count, same order, same content, compared by fingerprint.
+
+    Args:
+        undo_path (str): The undo file that was just written.
+        writer (RegFileWriter): The writer that wrote it (created with track_content=True).
+
+    Returns:
+        list[str]: Problems found (empty list = the backup is valid and cleaning may go on).
+    """
+    try:
+        size = os.path.getsize(undo_path)
+    except OSError as error:
+        return [f"the undo file is not there after writing ({error})"]
+    if size <= 0:
+        return ["the undo file is empty"]
+    return _verify_streamed_undo_file(undo_path, writer)
 
 
 def make_timestamp() -> str:
@@ -2847,6 +2987,7 @@ class CleanReport:
     failed: list[tuple[BrokenEntry, str]] = field(default_factory=list)    # (entry, error text)
     undo_file: str | None = None
     accepted_undo_problems: list[str] = field(default_factory=list)        # read-back problems the user chose to live with
+    seconds: float = 0.0                                                   # how long the run took (diagnostics only)
 
 
 class EntryProblemIndex:
@@ -3050,6 +3191,842 @@ class UndoFailureTracker:
     def forget(self, entry: BrokenEntry) -> None:
         """Drop a finding's history (it was deleted, so its earlier failures no longer matter)."""
         self._failures.pop(entry.identity, None)
+
+
+# =============================================================================
+# FINDING METADATA - icons, confidence, plain-language explanations (display only)
+# =============================================================================
+# Nothing in this section decides WHAT is found or deleted: the scanner finds, the allow-list and the delete guards decide
+# what MAY be deleted, the clean engine deletes. These tables only DESCRIBE a finding to the user.
+
+CATEGORY_ICONS: dict[str, str] = {
+    CATEGORY_UNINSTALL: "📦",       # package / archive
+    CATEGORY_SHARED_DLLS: "🧩",
+    CATEGORY_APP_PATHS: "🔗",
+    CATEGORY_STARTUP: "🚀",         # rocket / power
+    CATEGORY_MUI_CACHE: "🏷️",
+    CATEGORY_FONTS: "🔤",           # typography
+    CATEGORY_FILE_ASSOC: "📄",      # document
+    CATEGORY_CONTEXT_MENU: "🖱️",
+    CATEGORY_NET_HISTORY: "🌐",     # network
+}
+CATEGORY_SHORT_NAMES: dict[str, str] = {
+    CATEGORY_UNINSTALL: "Uninstall",
+    CATEGORY_SHARED_DLLS: "Shared DLL",
+    CATEGORY_APP_PATHS: "App path",
+    CATEGORY_STARTUP: "Startup",
+    CATEGORY_MUI_CACHE: "Name cache",
+    CATEGORY_FONTS: "Font",
+    CATEGORY_FILE_ASSOC: "File type",
+    CATEGORY_CONTEXT_MENU: "Right-click",
+    CATEGORY_NET_HISTORY: "Network",
+}
+
+
+class Confidence(Enum):
+    """How certain the SCANNER is that a finding is orphaned. It is derived from what the scanner proved - never guessed."""
+
+    VERY_SAFE = "Very Safe"
+    SAFE = "Safe"
+    REVIEW = "Review Recommended"
+
+
+CONFIDENCE_COLORS: dict[Confidence, str] = {
+    Confidence.VERY_SAFE: COLOR_SUCCESS,
+    Confidence.SAFE: COLOR_INFO,
+    Confidence.REVIEW: COLOR_WARNING,
+}
+CONFIDENCE_MEANING: dict[Confidence, str] = {
+    Confidence.VERY_SAFE: "Very Safe: everything this entry points to was checked and is missing, and removing it only discards "
+                          "bookkeeping or cache data that nothing needs any more.",
+    Confidence.SAFE: "Safe: the program, file or folder this entry points to was checked on a local drive and is missing.",
+    Confidence.REVIEW: "Review Recommended: this may be something you set up on purpose, or the scanner has no proof that it is "
+                       "orphaned. It starts unticked - look at it before you decide.",
+}
+# What each scan RULE proves (fixed by how the scanner is written, not by a score). A finding whose scanner recorded no
+# proof at all, and every finding the scanner itself flags for review, is "Review Recommended" - see assess_confidence().
+CATEGORY_CONFIDENCE: dict[str, Confidence] = {
+    CATEGORY_UNINSTALL: Confidence.VERY_SAFE,       # uninstaller, quiet uninstaller, install folder AND icon: every one that is named is missing
+    CATEGORY_SHARED_DLLS: Confidence.VERY_SAFE,     # a reference count for a file that is missing: pure bookkeeping
+    CATEGORY_MUI_CACHE: Confidence.VERY_SAFE,       # a cached display name for a program that is missing: Windows rebuilds it if needed
+    CATEGORY_APP_PATHS: Confidence.SAFE,
+    CATEGORY_STARTUP: Confidence.SAFE,
+    CATEGORY_FONTS: Confidence.SAFE,
+    CATEGORY_FILE_ASSOC: Confidence.SAFE,
+    CATEGORY_CONTEXT_MENU: Confidence.SAFE,
+    CATEGORY_NET_HISTORY: Confidence.REVIEW,        # history the user may have made on purpose
+}
+
+
+def assess_confidence(entry: BrokenEntry) -> Confidence:
+    """
+    The scanner's certainty about one finding.
+
+    Only facts the scanner itself produced are used: the rule that found it (CATEGORY_CONFIDENCE), whether it flagged the
+    finding for review, and whether it recorded any proof to re-check. No guessing, nothing is learned or estimated.
+
+    Args:
+        entry (BrokenEntry): A finding.
+
+    Returns:
+        Confidence: Very Safe, Safe or Review Recommended.
+    """
+    if entry.review_first:
+        return Confidence.REVIEW
+    if not entry.recheck_missing_paths and not entry.recheck_missing_progid:
+        return Confidence.REVIEW        # no recorded proof: never claim a certainty the scanner does not have
+    return CATEGORY_CONFIDENCE.get(entry.category, Confidence.REVIEW)
+
+
+RISK_BY_CATEGORY: dict[str, str] = {
+    CATEGORY_UNINSTALL: "Low - only the list entry goes; nothing installed is touched.",
+    CATEGORY_SHARED_DLLS: "Very low - a leftover reference count for a file that is already gone.",
+    CATEGORY_APP_PATHS: "Low - the Run dialog and ShellExecute stop knowing a program that is already gone.",
+    CATEGORY_STARTUP: "Low - Windows stops trying to start a program that is already gone.",
+    CATEGORY_MUI_CACHE: "Very low - a cache that Windows rebuilds whenever it is needed.",
+    CATEGORY_FONTS: "Low - the font file is already gone; only its list entry is removed.",
+    CATEGORY_FILE_ASSOC: "Low - Explorer may need a restart before old icons and menus disappear.",
+    CATEGORY_CONTEXT_MENU: "Low - Explorer may need a restart before the old menu item disappears.",
+    CATEGORY_NET_HISTORY: "Review - this can be history you created on purpose (it starts unticked).",
+}
+
+
+def explain_why_orphaned(entry: BrokenEntry) -> str:
+    """Plain-language reason why the scanner considers this finding orphaned (fixed text per kind of finding)."""
+    category = entry.category
+    if category == CATEGORY_UNINSTALL:
+        return ("The uninstaller this entry points to is missing, and so are the install folder and icon it names. "
+                "All of them were checked on a local fixed drive, so Windows can no longer uninstall the program from here.")
+    if category == CATEGORY_SHARED_DLLS:
+        return ("Installers keep a reference count for each shared file they put on the PC. The file this count belongs to "
+                "no longer exists, so the count is leftover bookkeeping.")
+    if category == CATEGORY_APP_PATHS:
+        return "This entry registers a program for the Run dialog, but the program file it points to no longer exists."
+    if category == CATEGORY_STARTUP:
+        return ("This entry starts a program when you sign in, but the program no longer exists "
+                "(and it was not switched off in Task Manager).")
+    if category == CATEGORY_MUI_CACHE:
+        return ("Windows cached a display name for a program that no longer exists, so the cached name is never used again; "
+                "Windows rebuilds the cache whenever it needs it.")
+    if category == CATEGORY_FONTS:
+        return "A font is registered with a file path outside the Windows folder, but that font file no longer exists."
+    if category == CATEGORY_FILE_ASSOC:
+        if entry.recheck_missing_progid:
+            return ("This file extension points to a program type that no longer exists, and the extension has no other "
+                    "settings that would keep it useful.")
+        return "Every command of this program type points to a program that no longer exists."
+    if category == CATEGORY_CONTEXT_MENU:
+        if "contextmenuhandlers" in entry.key_path.lower():
+            return ("This right-click handler loads a shell extension whose file no longer exists "
+                    "in any of its registrations.")
+        return "This right-click menu item runs a program that no longer exists."
+    if category == CATEGORY_NET_HISTORY:
+        return ("Windows remembers network locations you used before. They are listed for review only: they stay unticked "
+                "because they can be history you made on purpose, and unreachable shares can stall Explorer.")
+    return "The scanner could not find what this entry points to."
+
+
+def explain_what_is_removed(entry: BrokenEntry) -> str:
+    """Plain-language description of exactly what cleaning this finding removes."""
+    if entry.value_name is None:
+        return ("The whole registry key shown above, with all of its values and any subkeys below it. "
+                "A copy is saved to the undo file first.")
+    name = entry.value_name if entry.value_name else "(Default)"
+    return f"Only the value \"{name}\". The key and its other values stay. A copy of the value is saved to the undo file first."
+
+
+# =============================================================================
+# USER EXCLUSIONS - findings the user chose to keep, so they stop showing up
+# =============================================================================
+# The safety rule of this whole feature: an exclusion changes VISIBILITY ONLY.
+#   * the scanner still looks at everything (excluded findings are scanned like any other),
+#   * the filter runs AFTER the scan, on the finished list, and only ever REMOVES rows from what the user sees,
+#   * it never adds, ticks, re-validates or deletes anything, and it sits in front of - never inside - the allow-list,
+#     the delete guards and the clean engine, which therefore behave exactly as if the feature did not exist,
+#   * if the exclusions file cannot be loaded safely it is IGNORED (every finding stays visible) and the user is warned.
+# An exclusion is identified by category + registry path + value name + a fingerprint of the evidence behind the finding, so a
+# different finding that later lands on the same path (for example TypedPaths "url1" after the list shifted) is not hidden.
+
+EXCLUSIONS_FORMAT_NAME = "Windows Registry Cleaner exclusions"
+EXCLUSIONS_FORMAT_VERSION = 1
+EXCLUSIONS_FILE_NOTE = ("Findings listed here are hidden from the scan results; they are still scanned and nothing is deleted "
+                        "because of this file. The checksum covers the 'exclusions' list: if you edit the list by hand the "
+                        "checksum no longer matches and the whole file is ignored. Use 'Excluded Items' in the program instead.")
+
+ExclusionIdentity = tuple[str, str, bool, str, str]     # (category, key path lower, is a value, value name lower, fingerprint)
+
+
+def finding_fingerprint(entry: BrokenEntry) -> str:
+    """
+    A short fingerprint of the EVIDENCE behind a finding (what the scanner found missing), not of how it is displayed.
+
+    Built from the reason text, the re-check paths and the re-check ProgID - things that name the missing target. Volatile
+    details (reference counts, list positions, timestamps) are deliberately left out, so an exclusion keeps matching the
+    same finding; a changed target gives a new fingerprint, so the changed finding shows up again.
+
+    Args:
+        entry (BrokenEntry): A finding.
+
+    Returns:
+        str: 16 hex characters.
+    """
+    material = "\x1f".join([
+        entry.category,
+        entry.reason.strip().lower(),
+        "\x1e".join(sorted({path.lower() for path in entry.recheck_missing_paths})),
+        entry.recheck_missing_progid.lower(),
+    ])
+    return hashlib.sha256(material.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
+
+
+def exclusion_identity_of(entry: BrokenEntry) -> ExclusionIdentity:
+    """The stable identity of a finding for the exclusion list (registry names are case-insensitive, so lower-cased)."""
+    return (entry.category, entry.full_key_path.lower(), entry.value_name is not None,
+            (entry.value_name or "").lower(), finding_fingerprint(entry))
+
+
+@dataclass(frozen=True)
+class ExclusionRecord:
+    """One stored exclusion."""
+
+    category: str
+    registry_path: str          # full key path, e.g. HKEY_CURRENT_USER\Software\...
+    value_name: str | None      # None = the whole key
+    fingerprint: str
+    reason: str                 # what the scanner said was wrong when the user excluded it
+    date_excluded: str
+
+    @property
+    def identity(self) -> ExclusionIdentity:
+        """Same shape as exclusion_identity_of(), so records and findings can be compared directly."""
+        return (self.category, self.registry_path.lower(), self.value_name is not None,
+                (self.value_name or "").lower(), self.fingerprint)
+
+    @property
+    def display_path(self) -> str:
+        """Registry path for the list, with the value name appended when it is a single value."""
+        if self.value_name is None:
+            return self.registry_path
+        return f"{self.registry_path}  [{self.value_name or '(Default)'}]"
+
+
+def compute_exclusions_checksum(entries: list[dict[str, Any]]) -> str:
+    """SHA-256 over the canonical JSON of the exclusion list (independent of how the file is indented)."""
+    canonical = json.dumps(entries, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def exclusion_record_to_dict(record: ExclusionRecord) -> dict[str, Any]:
+    """The JSON form of one record."""
+    return {"category": record.category, "registry_path": record.registry_path, "value_name": record.value_name,
+            "fingerprint": record.fingerprint, "reason": record.reason, "date_excluded": record.date_excluded}
+
+
+def parse_exclusions_document(document: Any) -> list[ExclusionRecord]:
+    """
+    Validate a parsed exclusions file and turn it into records. EVERYTHING is checked; any doubt rejects the whole file.
+
+    Args:
+        document (Any): The result of json.load.
+
+    Returns:
+        list[ExclusionRecord]: The records.
+
+    Raises:
+        ValueError: With a readable reason if the file is not trustworthy (wrong format, newer version, bad checksum, bad entry).
+    """
+    if not isinstance(document, dict):
+        raise ValueError("the file does not contain an exclusions document")
+    if document.get("format") != EXCLUSIONS_FORMAT_NAME:
+        raise ValueError("this is not an exclusions file of this program")
+    version = document.get("format_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+        raise ValueError("the format version is missing or invalid")
+    if version > EXCLUSIONS_FORMAT_VERSION:
+        raise ValueError(f"the file was written by a newer version of the program (format {version})")
+    entries = document.get("exclusions")
+    if not isinstance(entries, list):
+        raise ValueError("the exclusion list is missing")
+    if len(entries) > MAX_EXCLUSIONS:
+        raise ValueError(f"the list holds more than {MAX_EXCLUSIONS} entries")
+    checksum = document.get("checksum_sha256")
+    if not isinstance(checksum, str) or checksum.lower() != compute_exclusions_checksum(entries):
+        raise ValueError("the checksum does not match: the file was edited or is damaged")
+    records: list[ExclusionRecord] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError("an exclusion entry is malformed")
+        category, path, value_name = item.get("category"), item.get("registry_path"), item.get("value_name")
+        fingerprint, reason, date_excluded = item.get("fingerprint"), item.get("reason"), item.get("date_excluded")
+        if not (isinstance(category, str) and category and isinstance(path, str) and path):
+            raise ValueError("an exclusion entry has no category or registry path")
+        if value_name is not None and not isinstance(value_name, str):
+            raise ValueError("an exclusion entry has an invalid value name")
+        if not (isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{16}", fingerprint)):
+            raise ValueError("an exclusion entry has an invalid fingerprint")
+        if not (isinstance(reason, str) and isinstance(date_excluded, str)):
+            raise ValueError("an exclusion entry has an invalid reason or date")
+        records.append(ExclusionRecord(category, path, value_name, fingerprint, reason, date_excluded))
+    return records
+
+
+class ExclusionStore:
+    """
+    The user's exclusions: kept in memory, saved to a dedicated human-readable JSON file (versioned and checksummed).
+
+    The store never raises into the program: every failure turns into load_ok / last_save_ok = False plus a message, and the
+    cleaner carries on (a store that could not be loaded simply behaves as an empty one).
+    """
+
+    def __init__(self, path: str | None = None) -> None:
+        """
+        Args:
+            path (str | None): Where the file lives (None = next to the program). The file is read right away.
+        """
+        self.path = path if path is not None else get_exclusions_path()
+        self._records: dict[ExclusionIdentity, ExclusionRecord] = {}
+        self.load_ok = True             # False = the file exists but could not be trusted, so its exclusions are being IGNORED
+        self.load_message = ""          # why (shown to the user)
+        self.last_save_ok = True
+        self.last_save_message = ""
+        self._damaged_file_present = False      # a damaged file is moved aside (never overwritten or deleted) before the next save
+        self.load()
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def load(self) -> bool:
+        """
+        (Re)read the file. A missing file is normal (no exclusions yet).
+
+        Returns:
+            bool: True if the store is usable as loaded; False if the file was rejected (the store is then empty).
+        """
+        self._records = {}
+        self.load_ok = True
+        self.load_message = ""
+        self._damaged_file_present = False
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            return True
+        except (OSError, UnicodeError) as error:
+            return self._reject(f"the exclusions file cannot be read ({error})")
+        try:
+            records = parse_exclusions_document(json.loads(raw))
+        except ValueError as error:      # json.JSONDecodeError is a ValueError too
+            return self._reject(f"the exclusions file cannot be trusted ({error})")
+        self._records = {record.identity: record for record in records}
+        log(f"[EXCLUSIONS] Loaded {len(self._records)} exclusion(s) from {self.path}")
+        return True
+
+    def _reject(self, message: str) -> bool:
+        """Remember why the file was rejected; the store stays empty so nothing is hidden."""
+        self._records = {}
+        self.load_ok = False
+        self.load_message = message
+        self._damaged_file_present = True
+        log(f"[WARNING] Exclusions IGNORED - {message}. Every finding stays visible; the file is left untouched.")
+        return False
+
+    def save(self) -> bool:
+        """
+        Write the file atomically (temp file, flush to disk, rename). A damaged file found at load time is moved aside first,
+        never overwritten, so nothing the user could still recover is destroyed.
+
+        Returns:
+            bool: True if saved. False = the exclusions still apply for this session but were not stored (see last_save_message).
+        """
+        entries = [exclusion_record_to_dict(record) for record in self.records()]
+        document = {
+            "format": EXCLUSIONS_FORMAT_NAME,
+            "format_version": EXCLUSIONS_FORMAT_VERSION,
+            "saved": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "note": EXCLUSIONS_FILE_NOTE,
+            "checksum_sha256": compute_exclusions_checksum(entries),
+            "exclusions": entries,
+        }
+        temp_path = self.path + ".tmp"
+        try:
+            if self._damaged_file_present and os.path.exists(self.path):
+                aside = f"{self.path}.damaged-{make_timestamp()}"
+                os.replace(self.path, aside)
+                log(f"[WARNING] The damaged exclusions file was kept as {aside}")
+            self._damaged_file_present = False
+            with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(document, handle, indent=2, ensure_ascii=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.path)
+        except (OSError, ValueError, TypeError) as error:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            self.last_save_ok = False
+            self.last_save_message = f"The exclusions could not be saved ({error})."
+            log(f"[WARNING] {self.last_save_message}")
+            return False
+        self.load_ok = True
+        self.load_message = ""
+        self.last_save_ok = True
+        self.last_save_message = ""
+        return True
+
+    def records(self) -> list[ExclusionRecord]:
+        """All exclusions in a stable order (category, path, value)."""
+        return sorted(self._records.values(), key=lambda r: (r.category, r.registry_path.lower(), (r.value_name or "").lower()))
+
+    def is_excluded(self, entry: BrokenEntry) -> bool:
+        """True if this finding is on the list."""
+        return exclusion_identity_of(entry) in self._records
+
+    def partition(self, findings: list[BrokenEntry]) -> tuple[list[BrokenEntry], list[BrokenEntry]]:
+        """
+        Split a finished scan into (visible, hidden). Both lists keep the scan order. The input list is not modified and
+        nothing is re-checked: this is the ONLY place where exclusions touch the results, and it only removes rows from view.
+        """
+        visible: list[BrokenEntry] = []
+        hidden: list[BrokenEntry] = []
+        for entry in findings:
+            (hidden if exclusion_identity_of(entry) in self._records else visible).append(entry)
+        return visible, hidden
+
+    def add(self, entries: list[BrokenEntry]) -> int:
+        """Add findings to the list and save. Returns how many were new."""
+        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        added = 0
+        for entry in entries:
+            identity = exclusion_identity_of(entry)
+            if identity in self._records:
+                continue
+            self._records[identity] = ExclusionRecord(entry.category, entry.full_key_path, entry.value_name,
+                                                      finding_fingerprint(entry), entry.reason, stamp)
+            added += 1
+        if added:
+            self.save()
+        return added
+
+    def remove(self, identities: list[ExclusionIdentity]) -> int:
+        """Remove exclusions by identity and save. Returns how many were removed."""
+        removed = 0
+        for identity in identities:
+            if self._records.pop(identity, None) is not None:
+                removed += 1
+        if removed:
+            self.save()
+        return removed
+
+    def clear(self) -> int:
+        """Remove every exclusion and save. Returns how many there were."""
+        count = len(self._records)
+        self._records = {}
+        if count:
+            self.save()
+        return count
+
+
+# =============================================================================
+# REGISTRY PREVIEW + CLEAN IMPACT - read-only helpers that show what a cleaning WOULD do
+# =============================================================================
+
+@dataclass(frozen=True)
+class RegistryPreview:
+    """A before/after view of one finding, built by reading the registry (nothing is written)."""
+
+    exists: bool                        # False = the key or value is already gone
+    current_lines: tuple[str, ...]      # what is in the registry now
+    removal_lines: tuple[str, ...]      # what cleaning would delete
+
+
+def count_key_tree(hive_name: str, key_path: str, key_limit: int = PREVIEW_TREE_KEY_LIMIT,
+                   deadline: float | None = None) -> tuple[int, int, bool]:
+    """
+    Count the keys and values in a key tree (read-only), without reading any value data.
+
+    Args:
+        hive_name (str): Long hive name.
+        key_path (str): The key below the hive.
+        key_limit (int): Stop after this many keys.
+        deadline (float | None): time.monotonic() value after which to stop (None = no time limit).
+
+    Returns:
+        tuple[int, int, bool]: (keys, values, complete) - complete is False if a limit stopped the count (the numbers are then "at least").
+    """
+    keys = 0
+    values = 0
+    complete = True
+    pending = [key_path]
+    while pending:
+        if keys >= key_limit or (deadline is not None and time.monotonic() > deadline):
+            return keys, values, False
+        current = pending.pop()
+        try:
+            with open_registry_key(hive_name, current) as handle:
+                subkey_count, value_count = winreg.QueryInfoKey(handle)[:2]
+        except OSError:
+            complete = False         # a key that cannot be read cannot be counted
+            continue
+        keys += 1
+        values += value_count
+        if subkey_count:
+            pending.extend(f"{current}\\{name}" for name in list_subkey_names(hive_name, current))
+    return keys, values, complete
+
+
+def _preview_value_line(value: RegValue) -> str:
+    """One line for a value: name, type, shortened data."""
+    type_name = REG_TYPE_NAMES.get(value.value_type, f"type {value.value_type}")
+    return f"{value.name or '(Default)'}  [{type_name}]  {short_value_text(value, 80)}"
+
+
+def build_registry_preview(entry: BrokenEntry) -> RegistryPreview:
+    """
+    Show what is in the registry for a finding right now, and what cleaning would delete. READ-ONLY.
+
+    Args:
+        entry (BrokenEntry): A finding.
+
+    Returns:
+        RegistryPreview: Lines for the 'current registry entry' and 'will be deleted' sections.
+    """
+    if entry.value_name is not None:
+        value = read_registry_value(entry.hive_name, entry.key_path, entry.value_name)
+        if value is None:
+            return RegistryPreview(False, (), ())
+        return RegistryPreview(True, (_preview_value_line(value),),
+                               (f"{value.name or '(Default)'}  - only this value; the key and its other values stay",))
+    if not registry_key_exists(entry.hive_name, entry.key_path):
+        return RegistryPreview(False, (), ())
+    values = read_registry_values(entry.hive_name, entry.key_path)
+    subkeys = list_subkey_names(entry.hive_name, entry.key_path)
+    current: list[str] = [f"[{entry.full_key_path}]"]
+    current.extend(_preview_value_line(value) for value in values[:PREVIEW_MAX_VALUE_LINES])
+    if len(values) > PREVIEW_MAX_VALUE_LINES:
+        current.append(f"... and {len(values) - PREVIEW_MAX_VALUE_LINES} more value(s)")
+    if not values:
+        current.append("(no values in this key)")
+    if subkeys:
+        shown = ", ".join(subkeys[:PREVIEW_MAX_SUBKEY_LINES]) + (", ..." if len(subkeys) > PREVIEW_MAX_SUBKEY_LINES else "")
+        current.append(f"{len(subkeys)} subkey(s): {shown}")
+    keys, total_values, complete = count_key_tree(entry.hive_name, entry.key_path)
+    amount = f"{keys} key(s) and {total_values} value(s)" if complete else f"at least {keys} key(s) and {total_values} value(s)"
+    removal = (f"the whole key and everything below it ({amount})",)
+    return RegistryPreview(True, tuple(current), removal)
+
+
+@dataclass(frozen=True)
+class CleanImpact:
+    """What a Clean run on the selected findings would modify - worked out BEFORE the user confirms; nothing is changed."""
+
+    items: int                  # findings selected
+    categories: int             # kinds of findings among them
+    undo_entries: int           # entries that will be written to (and verified in) the undo file: one per finding
+    key_findings: int           # findings that delete a whole key tree
+    value_findings: int         # findings that delete a single value
+    keys: int                   # keys that will be removed, subkeys included
+    values: int                 # values that will be removed (inside those keys, plus the single-value findings)
+    complete: bool              # False = the key counts are "at least" (the count was stopped to keep the window responsive)
+
+
+def summarize_clean_impact(entries: list[BrokenEntry], key_limit: int = IMPACT_TREE_KEY_LIMIT,
+                           time_budget: float = IMPACT_TIME_BUDGET_SECONDS) -> CleanImpact:
+    """
+    Work out what cleaning the selected findings would modify (read-only; bounded in keys and in time).
+
+    Args:
+        entries (list[BrokenEntry]): The findings the user selected.
+        key_limit (int): Count at most this many keys in total.
+        time_budget (float): Stop counting after this many seconds.
+
+    Returns:
+        CleanImpact: The numbers shown in the confirmation box.
+    """
+    deadline = time.monotonic() + time_budget
+    keys = 0
+    values = 0
+    complete = True
+    key_findings = 0
+    for entry in entries:
+        if entry.value_name is not None:
+            values += 1
+            continue
+        key_findings += 1
+        remaining = key_limit - keys
+        if remaining <= 0 or time.monotonic() > deadline:
+            complete = False
+            keys += 1                       # at least the key itself
+            continue
+        tree_keys, tree_values, tree_complete = count_key_tree(entry.hive_name, entry.key_path, remaining, deadline)
+        keys += tree_keys
+        values += tree_values
+        complete = complete and tree_complete
+    return CleanImpact(len(entries), len({entry.category for entry in entries}), len(entries), key_findings,
+                       len(entries) - key_findings, keys, values, complete)
+
+
+# =============================================================================
+# TELEMETRY - numbers for diagnostics, written to the normal log (no personal data, nothing leaves the PC)
+# =============================================================================
+
+def log_telemetry(event: str, **measurements: int | float | bool) -> None:
+    """
+    Log one diagnostics line such as "[TELEMETRY] scan seconds=2.314 findings=24".
+
+    Only numbers and yes/no values are accepted. Text (paths, names) is DROPPED on purpose, so a telemetry line cannot
+    carry personal data; the keys are program-defined words.
+
+    Args:
+        event (str): What was measured ("scan", "clean", ...).
+        **measurements: The measurements.
+    """
+    parts: list[str] = []
+    for name, value in measurements.items():
+        if isinstance(value, bool):
+            parts.append(f"{name}={'yes' if value else 'no'}")
+        elif isinstance(value, int):
+            parts.append(f"{name}={value}")
+        elif isinstance(value, float):
+            parts.append(f"{name}={value:.3f}")
+    log(f"[TELEMETRY] {event} " + " ".join(parts))
+
+
+@dataclass
+class ScanOutcome:
+    """What a scan task hands back to the window: the findings plus how long it took."""
+
+    findings: list[BrokenEntry]
+    seconds: float
+    categories_scanned: int
+
+
+# =============================================================================
+# SAFETY SELF-CHECK - proves at start-up that the safety machinery works (and keeps proving it before every clean)
+# =============================================================================
+# ISOLATION RULES of this section (enforced by test_self_check_isolation.py, which proves them with a tripwire and a call-graph walk):
+#   1. Nothing here calls a function that writes OR deletes registry data - not even with an argument that function would refuse.
+#   2. Nothing here opens a registry handle, reads the registry or starts a process. The only registry-module function reachable from
+#      the self-check is winreg.ExpandEnvironmentStrings (it expands %VARIABLES% in a string); the only other OS call is the read-only
+#      drive-type query behind is_on_local_fixed_drive().
+#   3. Inputs are made-up BrokenEntry / RegValue objects. The only file-system writes happen inside a throw-away temp folder.
+# This does not trust that the allow-list and the guards are "loaded": it RUNS them on made-up findings. Entries that must be
+# deletable have to be accepted, entries that must never be deleted have to be refused, and the undo writer/reader must
+# round-trip. Any failure of these CRITICAL checks disables cleaning (fail closed) until the program is fixed.
+
+@dataclass(frozen=True)
+class SafetyCheck:
+    """The result of one self-check."""
+
+    key: str            # "allowlist", "delete_guards", "protected_paths", "undo_system", "backup_folder", "exclusions"
+    title: str
+    passed: bool
+    critical: bool      # a failed critical check disables cleaning
+    detail: str
+
+
+@dataclass(frozen=True)
+class SafetyReport:
+    """All self-check results."""
+
+    checks: tuple[SafetyCheck, ...]
+
+    @property
+    def has_critical_failure(self) -> bool:
+        """True if a check that cleaning depends on failed."""
+        return any(check.critical and not check.passed for check in self.checks)
+
+    @property
+    def has_warning(self) -> bool:
+        """True if only non-critical checks failed."""
+        return any(not check.critical and not check.passed for check in self.checks)
+
+    @property
+    def status_text(self) -> str:
+        """'Healthy', 'Attention needed' or 'Cleaning disabled'."""
+        if self.has_critical_failure:
+            return "Cleaning disabled"
+        return "Attention needed" if self.has_warning else "Healthy"
+
+    def passed(self, *keys: str) -> bool:
+        """True if every named check exists and passed."""
+        by_key = {check.key: check for check in self.checks}
+        return all(key in by_key and by_key[key].passed for key in keys)
+
+    def failures(self) -> list[SafetyCheck]:
+        """The failed checks, critical ones first."""
+        return sorted((check for check in self.checks if not check.passed), key=lambda check: not check.critical)
+
+
+def _probe(category: str, hive: str, key_path: str, value_name: str | None = None) -> BrokenEntry:
+    """A made-up finding for the self-check."""
+    return BrokenEntry(category=category, hive_name=hive, key_path=key_path, value_name=value_name, reason="self-check", detail="")
+
+
+_EXPLORER = r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+_UNINSTALL = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+_SHARED_DLLS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs"
+
+# Findings the allow-list MUST accept (one of each kind the scanner produces) ...
+def _allowlist_must_accept() -> list[BrokenEntry]:
+    return [
+        _probe(CATEGORY_UNINSTALL, HKLM, _UNINSTALL + r"\SelfCheckApp"),
+        _probe(CATEGORY_SHARED_DLLS, HKLM, _SHARED_DLLS, r"C:\SelfCheck\x.dll"),
+        _probe(CATEGORY_APP_PATHS, HKCU, r"Software\Microsoft\Windows\CurrentVersion\App Paths\selfcheck.exe"),
+        _probe(CATEGORY_STARTUP, HKCU, r"Software\Microsoft\Windows\CurrentVersion\Run", "SelfCheck"),
+        _probe(CATEGORY_MUI_CACHE, HKCU, r"Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache",
+               r"C:\SelfCheck\a.exe.FriendlyAppName"),
+        _probe(CATEGORY_FONTS, HKCU, r"Software\Microsoft\Windows NT\CurrentVersion\Fonts", "SelfCheck Font (TrueType)"),
+        _probe(CATEGORY_FILE_ASSOC, HKCU, r"Software\Classes\.selfcheck"),
+        _probe(CATEGORY_CONTEXT_MENU, HKCU, r"Software\Classes\*\shell\SelfCheckVerb"),
+        _probe(CATEGORY_NET_HISTORY, HKCU, _EXPLORER + r"\TypedPaths", "url1"),
+        _probe(CATEGORY_NET_HISTORY, HKCU, _EXPLORER + r"\Map Network Drive MRU"),
+        _probe(CATEGORY_NET_HISTORY, HKCU, _EXPLORER + r"\MountPoints2\##selfcheck#share"),
+    ]
+
+
+# ... and findings it MUST refuse (system locations, the containers themselves, protected types and verbs, the (Default) value).
+def _allowlist_must_refuse() -> list[BrokenEntry]:
+    return [
+        _probe(CATEGORY_STARTUP, HKLM, r"SYSTEM\CurrentControlSet\Services\SelfCheck", "ImagePath"),
+        _probe(CATEGORY_UNINSTALL, HKLM, _UNINSTALL),
+        _probe(CATEGORY_UNINSTALL, HKLM, "SOFTWARE"),
+        _probe(CATEGORY_FILE_ASSOC, HKCU, r"Software\Classes\exefile"),
+        _probe(CATEGORY_FILE_ASSOC, HKCU, r"Software\Classes\.exe"),
+        _probe(CATEGORY_CONTEXT_MENU, HKCU, r"Software\Classes\Directory\shell\open"),
+        _probe(CATEGORY_SHARED_DLLS, HKLM, _SHARED_DLLS, ""),
+        _probe(CATEGORY_NET_HISTORY, HKCU, _EXPLORER + r"\MountPoints2"),
+        _probe(CATEGORY_NET_HISTORY, HKCU, _EXPLORER + r"\TypedPaths", "notaurl"),
+        _probe("not_a_category", HKCU, r"Software\SelfCheck"),
+    ]
+
+
+def check_allowlist() -> SafetyCheck:
+    """Run the allow-list on made-up findings: legitimate ones must be accepted, forbidden ones refused."""
+    title = "Allowlist"
+    try:
+        wrongly_refused = [e.display_location for e in _allowlist_must_accept() if not is_delete_allowed(e)[0]]
+        wrongly_accepted = [e.display_location for e in _allowlist_must_refuse() if is_delete_allowed(e)[0]]
+    except Exception as error:      # a crashing guard is a failed guard
+        return SafetyCheck("allowlist", title, False, True, f"the allow-list raised an error ({error})")
+    if wrongly_accepted:
+        return SafetyCheck("allowlist", title, False, True, f"it accepted something it must refuse: {wrongly_accepted[0]}")
+    if wrongly_refused:
+        return SafetyCheck("allowlist", title, False, True, f"it refused something it must accept: {wrongly_refused[0]}")
+    return SafetyCheck("allowlist", title, True, True, "accepts exactly the supported locations and refuses everything else")
+
+
+def check_delete_guards() -> SafetyCheck:
+    """
+    Check the guards that stand between a finding and a deletion by evaluating the guard PREDICATES on made-up strings.
+
+    No deleting function is called here - not even with an argument it would refuse. A self-test must never depend on another
+    function's own first-line guard to stay harmless, so is_critical_key_path() and is_delete_allowed() are exercised instead
+    (the clean engine consults both before it deletes anything).
+    """
+    title = "Delete guards"
+    try:
+        for path in ("HKEY_LOCAL_MACHINE", r"HKEY_LOCAL_MACHINE\SOFTWARE", r"HKEY_CURRENT_USER\Software\Classes"):
+            if not is_critical_key_path(path):
+                return SafetyCheck("delete_guards", title, False, True, f"{path} is no longer protected")
+        if is_critical_key_path(r"HKEY_CURRENT_USER\Software\SelfCheckVendor\SelfCheck"):
+            return SafetyCheck("delete_guards", title, False, True, "the critical-key guard blocks ordinary keys")
+        for hive in (HKLM, HKCU, HKCR):             # a finding that IS a hive root (empty key path) must never be deletable
+            for key_path in ("", "\\"):
+                for category in (CATEGORY_UNINSTALL, CATEGORY_FILE_ASSOC, CATEGORY_CONTEXT_MENU):
+                    if is_delete_allowed(_probe(category, hive, key_path))[0]:
+                        return SafetyCheck("delete_guards", title, False, True, f"a hive root ({hive}) was accepted as deletable")
+    except Exception as error:
+        return SafetyCheck("delete_guards", title, False, True, f"a guard raised an error ({error})")
+    return SafetyCheck("delete_guards", title, True, True, "hive roots and system keys are protected")
+
+def check_protected_paths() -> SafetyCheck:
+    """The protected-path list (Windows and Program Files folders) must be present: it keeps system files from looking 'missing'."""
+    title = "Protected paths"
+    try:
+        prefixes = get_protected_prefixes()
+        system32 = os.path.join(expand_env_vars("%SystemRoot%"), "System32", "selfcheck.dll")
+        if not prefixes or not is_protected_path(system32):
+            return SafetyCheck("protected_paths", title, False, True, "the protected-path list is empty or incomplete")
+    except Exception as error:
+        return SafetyCheck("protected_paths", title, False, True, f"the protected-path list raised an error ({error})")
+    return SafetyCheck("protected_paths", title, True, True, f"{len(prefixes)} protected locations loaded")
+
+
+def check_undo_system() -> SafetyCheck:
+    """
+    Round-trip made-up data through the real undo writer, reader and verification in a throw-away temp folder.
+
+    Trouble with the ENVIRONMENT (no temporary folder to test in) is only a warning - it says nothing about the program.
+    A failure of the write / read-back / verify itself is critical: cleaning relies on exactly that machinery.
+    """
+    title = "Undo backup"
+    try:
+        # ignore_cleanup_errors: a virus scanner holding the test file for a moment must not look like a broken undo system
+        scratch = tempfile.TemporaryDirectory(prefix="wrc_selfcheck_", ignore_cleanup_errors=True)
+    except OSError as error:
+        return SafetyCheck("undo_system", title, False, False, f"no writable temporary folder to test in ({error})")
+    with scratch as folder:
+        try:
+            plan = UndoPlan()
+            key = r"Software\SelfCheck"
+            for value in (RegValue("Text", winreg.REG_SZ, 'a "quoted" \\ text'), RegValue("Number", winreg.REG_DWORD, 7),
+                          RegValue("Bytes", winreg.REG_BINARY, b"\x00\x01\xff"), RegValue("Many", winreg.REG_MULTI_SZ, ["a", "b"]),
+                          RegValue("Expand", winreg.REG_EXPAND_SZ, r"%SystemRoot%\selfcheck")):
+                plan.add_value_restore(HKCU, key, value)
+            plan.add_value_removal(HKCU, key, "NewValue")
+            plan.write_and_verify(os.path.join(folder, "selfcheck_undo.reg"))
+        except Exception as error:
+            return SafetyCheck("undo_system", title, False, True, f"writing and verifying an undo file failed ({error})")
+    return SafetyCheck("undo_system", title, True, True, "undo files are written, read back and verified")
+
+def check_backup_folder(backup_root: str) -> SafetyCheck:
+    """
+    Check that the backup folder can receive undo files. A network, removable or offline location is NOT probed here (a dead
+    share would freeze the window at start-up) - it is verified, fail-closed, when a cleaning starts.
+    """
+    title = "Backup folder"
+    if not is_on_local_fixed_drive(backup_root):
+        return SafetyCheck("backup_folder", title, True, False, "not on a local drive - checked when a cleaning starts")
+    folder = backup_root
+    while folder and not os.path.isdir(folder):
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            break
+        folder = parent
+    if folder and os.path.isdir(folder) and os.access(folder, os.W_OK):
+        return SafetyCheck("backup_folder", title, True, False, "ready")
+    return SafetyCheck("backup_folder", title, False, False, f"{backup_root} cannot be written to - choose another folder in the Backup tab")
+
+
+def check_exclusions(store: ExclusionStore | None) -> SafetyCheck:
+    """The exclusions file is optional: a damaged one is ignored (not critical), but the user is told."""
+    title = "Exclusions"
+    if store is None or store.load_ok:
+        count = 0 if store is None else len(store)
+        return SafetyCheck("exclusions", title, True, False, f"{count} loaded")
+    return SafetyCheck("exclusions", title, False, False, f"ignored - {store.load_message}")
+
+
+def run_safety_self_check(backup_root: str, store: ExclusionStore | None, full: bool = True) -> SafetyReport:
+    """
+    Run the self-check.
+
+    Args:
+        backup_root (str): The configured backup folder.
+        store (ExclusionStore | None): The exclusions (their load state is reported).
+        full (bool): False = only the instant in-memory checks (used right before every clean).
+
+    Returns:
+        SafetyReport: Every check's result.
+    """
+    checks = [check_allowlist(), check_delete_guards(), check_protected_paths()]
+    if full:
+        checks.extend([check_undo_system(), check_backup_folder(backup_root), check_exclusions(store)])
+    report = SafetyReport(tuple(checks))
+    log(f"[SAFETY] Self-check: {report.status_text} - " + ", ".join(f"{c.title}={'ok' if c.passed else 'FAILED'}" for c in report.checks))
+    return report
 
 
 # =============================================================================
@@ -4174,89 +5151,106 @@ def _verify_streamed_undo_file(undo_path: str, writer: RegFileWriter) -> list[st
 
 
 # =============================================================================
-# RESTART ADVICE - does a change need a restart?  (heuristic scores: see the RESTART_* constants)
+# RESTART ADVICE - a 3-tier impact classification (weights and thresholds: see the RESTART_* constants)
 # =============================================================================
-# After a change the tool says whether a restart is advised instead of always (or never) asking for one:
-#   * every kind of change has a score (0 = nothing to restart ... 7 = only read while Windows starts),
-#   * the scores of the DISTINCT kinds that were changed are added up,
-#   * below RESTART_RECOMMENDED_AT -> "No restart is needed", from there "recommended", from RESTART_STRONG_AT "strongly",
-#   * if Windows already has a restart pending (from other software), a restart is at least "recommended".
-# Routine cleaning of broken entries scores 0-1 per kind, so it stays below the threshold and never nags.
+# After a change the tool decides whether to say ANYTHING about restarting - and the default is: nothing.
+#   * every kind of change has a WEIGHT (0 = bookkeeping nobody reads while it runs, 1 = a running program may have
+#     loaded it, 2 = right-click handlers); every deleted entry adds the weight of its kind,
+#   * TIER 0 (below RESTART_TIER1_AT points):  no restart needed - NO popup, NO dialog, NO banner, NO notification,
+#   * TIER 1 (from RESTART_TIER1_AT points):   restart recommended - one optional, non-modal note with an OK button,
+#   * TIER 2 (from RESTART_TIER2_AT points):   restart strongly recommended - the Restart Now / Restart Later box,
+#   * a restart that Windows ALREADY has pending (from other software) raises the tier by one - but only for a change that
+#     is big enough to matter (RESTART_PENDING_MIN_POINTS). "Windows is waiting for a restart" says nothing about whether
+#     THIS cleanup needs one, so on its own it never produces a prompt (it used to: that was the cause of the nagging).
+# Kinds with weight 0 can never raise the tier, however many entries are removed. Routine orphan cleanups stay in Tier 0.
 
-class RestartLevel(Enum):
-    """How strongly a restart of Windows is advised."""
+class RestartTier(IntEnum):
+    """How strongly a restart of Windows is advised (the three tiers)."""
 
-    NONE = "none"
-    RECOMMENDED = "recommended"
-    STRONG = "strong"
+    NONE = 0           # Tier 0 - no restart needed: nothing is shown at all
+    RECOMMENDED = 1    # Tier 1 - restart recommended: one optional, non-modal note (OK only, nothing is scheduled)
+    STRONG = 2         # Tier 2 - restart strongly recommended: the Restart Now / Restart Later box
 
 
 @dataclass(frozen=True)
 class RestartImpact:
     """One kind of change that was made and how much it needs a restart."""
 
-    label: str      # what changed; the same label is only counted once, however many entries of that kind were touched
-    score: int      # one of the RESTART_SCORE_* values
+    label: str      # what changed; one label counts once (with its biggest contribution)
+    weight: int     # points per changed entry of this kind (a RESTART_WEIGHT_* / RESTART_*_POINTS value)
     reason: str     # shown to the user when this contributes to a restart advice
+    count: int = 1  # how many entries of this kind were changed (Restore/Import count a kind once: their weight is the whole point value)
+
+    @property
+    def points(self) -> int:
+        """The points this kind contributes: weight x entries."""
+        return self.weight * max(0, self.count)
 
 
 @dataclass(frozen=True)
 class RestartAdvice:
     """The result of assessing a finished operation."""
 
-    level: RestartLevel
-    score: int                      # total impact score (0 if only a pending restart made it "recommended")
-    reasons: tuple[str, ...]        # why, most important first
+    tier: RestartTier
+    points: int                     # total impact points of the changes themselves
+    reasons: tuple[str, ...]        # why, most important first (empty in Tier 0)
+    pending_applied: bool = False   # True if an already-pending Windows restart raised the tier
 
     @property
     def needs_restart(self) -> bool:
-        """True if the user should be offered "Restart Now / Restart Later"."""
-        return self.level is not RestartLevel.NONE
+        """True if the user gets any restart message at all (Tier 1 or 2)."""
+        return self.tier is not RestartTier.NONE
+
+    @property
+    def offers_restart_now(self) -> bool:
+        """True only in Tier 2: the one tier that offers \"Restart Now / Restart Later\"."""
+        return self.tier is RestartTier.STRONG
 
 
-# Clean categories -> (score, reason). Almost everything here is only bookkeeping that no running program reads.
+# Clean categories -> (weight per deleted entry, reason). Weight 0 = bookkeeping that no running program reads.
 CLEAN_RESTART_IMPACT: dict[str, tuple[int, str]] = {
-    CATEGORY_UNINSTALL: (RESTART_SCORE_NONE, ""),
-    CATEGORY_SHARED_DLLS: (RESTART_SCORE_NONE, ""),
-    CATEGORY_APP_PATHS: (RESTART_SCORE_NONE, ""),
-    CATEGORY_STARTUP: (RESTART_SCORE_NONE, ""),      # only decides what starts at the NEXT sign-in
-    CATEGORY_MUI_CACHE: (RESTART_SCORE_NONE, ""),
-    CATEGORY_FONTS: (RESTART_SCORE_NONE, ""),
-    CATEGORY_NET_HISTORY: (RESTART_SCORE_NONE, ""),
-    CATEGORY_FILE_ASSOC: (RESTART_SCORE_PROGRAMS, "Explorer may keep showing old file-type icons and menus until it is restarted."),
-    CATEGORY_CONTEXT_MENU: (RESTART_SCORE_PROGRAMS, "Explorer may keep showing old right-click items until it is restarted."),
+    CATEGORY_UNINSTALL: (RESTART_WEIGHT_NONE, ""),
+    CATEGORY_SHARED_DLLS: (RESTART_WEIGHT_NONE, ""),
+    CATEGORY_NET_HISTORY: (RESTART_WEIGHT_NONE, ""),
+    CATEGORY_MUI_CACHE: (RESTART_WEIGHT_NONE, ""),
+    CATEGORY_FILE_ASSOC: (RESTART_WEIGHT_LOW, "Explorer may keep showing old file-type icons and menus until it is restarted."),
+    CATEGORY_STARTUP: (RESTART_WEIGHT_LOW, "Startup entries are read when you sign in."),
+    CATEGORY_APP_PATHS: (RESTART_WEIGHT_LOW, "Programs that are already running may keep using the old program paths until they are restarted."),
+    CATEGORY_FONTS: (RESTART_WEIGHT_LOW, "Programs that are already running may keep using the old font list until they are restarted."),
+    CATEGORY_CONTEXT_MENU: (RESTART_WEIGHT_SHELL, "Explorer may keep showing old right-click items until it is restarted."),
 }
 
-# Restore areas -> (score, reason).
+# Restore areas -> (points, reason). Restore/Import count a kind ONCE; RESTART_SIGN_IN_POINTS / RESTART_BOOT_POINTS are
+# sized so a single such kind reaches Tier 1 / Tier 2 on its own.
 RESTORE_RESTART_IMPACT: dict[str, tuple[int, str]] = {
-    AREA_POLICY_LOCKS: (RESTART_SCORE_PROGRAMS, "Restored tools work the next time they are opened."),
-    AREA_ASSOCIATIONS: (RESTART_SCORE_SHELL, "Explorer caches file associations: restart (or sign out and back in) so every program sees the repaired ones."),
-    AREA_SHELL_FOLDERS: (RESTART_SCORE_SHELL, "Folder locations (Desktop, Documents, ...) are read when you sign in: restart, or sign out and back in."),
+    AREA_POLICY_LOCKS: (RESTART_WEIGHT_LOW, "Restored tools work the next time they are opened."),
+    AREA_ASSOCIATIONS: (RESTART_SIGN_IN_POINTS, "Explorer caches file associations: restart (or sign out and back in) so every program sees the repaired ones."),
+    AREA_SHELL_FOLDERS: (RESTART_SIGN_IN_POINTS, "Folder locations (Desktop, Documents, ...) are read when you sign in: restart, or sign out and back in."),
 }
 SHELL_READ_POLICY_VALUES = frozenset({"nocontrolpanel"})     # policy values Explorer reads at sign-in (lower-case)
-CONTROL_PANEL_POLICY_IMPACT = RestartImpact("Control Panel lock", RESTART_SCORE_SHELL,
+CONTROL_PANEL_POLICY_IMPACT = RestartImpact("Control Panel lock", RESTART_SIGN_IN_POINTS,
                                             "Explorer reads the Control Panel lock at sign-in: restart, or sign out and back in.")
 
-# Import: (label, score, reason, regex on the full key path). The FIRST rule that matches a key wins, so the specific
-# rules come before the broad ones. Keys that match no rule (for example HKEY_CURRENT_USER\SOFTWARE\SomeApp) score 0.
+# Import: (label, points, reason, regex on the full key path). The FIRST rule that matches a key wins, so the specific
+# rules come before the broad ones. Keys that match no rule (for example HKEY_CURRENT_USER\SOFTWARE\SomeApp) count 0 points.
 _SOFTWARE_HIVES = r"HKEY_(?:LOCAL_MACHINE|CURRENT_USER)\\SOFTWARE"
 IMPORT_RESTART_RULES: tuple[tuple[str, int, str, str], ...] = (
-    ("System settings", RESTART_SCORE_BOOT,
+    ("System settings", RESTART_BOOT_POINTS,
      "System settings (HKEY_LOCAL_MACHINE\\SYSTEM: services, drivers, start-up) are only read while Windows starts.",
      r"HKEY_LOCAL_MACHINE\\SYSTEM(?:\\|$)"),
-    ("Shell folder locations", RESTART_SCORE_SHELL,
+    ("Shell folder locations", RESTART_SIGN_IN_POINTS,
      "Folder locations (Desktop, Documents, ...) are read when you sign in.",
      _SOFTWARE_HIVES + r"\\Microsoft\\Windows\\CurrentVersion\\Explorer\\(?:User )?Shell Folders(?:\\|$)"),
-    ("Sign-in settings", RESTART_SCORE_SHELL,
+    ("Sign-in settings", RESTART_SIGN_IN_POINTS,
      "Sign-in (Winlogon) settings are read when you sign in.",
      _SOFTWARE_HIVES + r"\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon(?:\\|$)"),
-    ("Policies", RESTART_SCORE_SHELL,
+    ("Policies", RESTART_SIGN_IN_POINTS,
      "Policies are applied by Windows and Explorer when you sign in.",
      _SOFTWARE_HIVES + r"\\(?:Policies|Microsoft\\Windows\\CurrentVersion\\Policies)(?:\\|$)"),
-    ("File types and shell classes", RESTART_SCORE_PROGRAMS,
+    ("File types and shell classes", RESTART_WEIGHT_LOW,
      "Explorer may keep showing old file-type icons and menus until it is restarted.",
      r"HKEY_CLASSES_ROOT(?:\\|$)|" + _SOFTWARE_HIVES + r"\\Classes(?:\\|$)"),
-    ("Machine-wide program settings", RESTART_SCORE_PROGRAMS,
+    ("Machine-wide program settings", RESTART_WEIGHT_LOW,
      "Programs that are already running keep their old settings until they are restarted.",
      r"HKEY_LOCAL_MACHINE\\SOFTWARE(?:\\|$)"),
 )
@@ -4273,10 +5267,13 @@ PENDING_RESTART_CHECKS: tuple[tuple[str, str, str, str], ...] = (
     (HKLM, r"SYSTEM\CurrentControlSet\Control\Session Manager", "PendingFileRenameOperations",
      "Some software has files waiting to be replaced at the next restart."),
 )
-RESTART_HEADLINES: dict[RestartLevel, str] = {
-    RestartLevel.NONE: "✅ No restart is needed.",
-    RestartLevel.RECOMMENDED: "⚠ A restart is recommended so Windows fully applies these changes.",
-    RestartLevel.STRONG: "🔴 A restart is strongly recommended: some changes are not fully applied until Windows restarts.",
+# Tier 1 wording is fixed on purpose: one calm sentence, nothing to decide.
+RESTART_TIER1_MESSAGE = ("A system restart is recommended to ensure all Windows components observe the changes. "
+                         "The restart is optional and can be performed later.")
+CLEAN_TIER1_NOTE = "Cleanup completed successfully.\n\n" + RESTART_TIER1_MESSAGE
+RESTART_HEADLINES: dict[RestartTier, str] = {
+    RestartTier.RECOMMENDED: RESTART_TIER1_MESSAGE,
+    RestartTier.STRONG: "🔴 A restart is strongly recommended: some changes are not fully applied until Windows restarts.",
 }
 
 
@@ -4306,46 +5303,59 @@ def detect_pending_restart_reasons() -> list[str]:
     return reasons
 
 
-def assess_restart_need(impacts: list[RestartImpact], pending_reasons: list[str]) -> RestartAdvice:
+def assess_restart_need(impacts: list[RestartImpact], pending_reasons: list[str] | None = None) -> RestartAdvice:
     """
-    Turn the kinds of change that were made into a restart advice.
+    Turn the kinds of change that were made into a restart tier.
 
     Args:
-        impacts (list[RestartImpact]): Everything that was changed (the same label counts once, with its highest score).
-        pending_reasons (list[str]): Reasons Windows ALREADY has a restart pending (from detect_pending_restart_reasons).
+        impacts (list[RestartImpact]): Everything that was changed (the same label counts once, with its biggest contribution).
+        pending_reasons (list[str] | None): Reasons Windows ALREADY has a restart pending. None = look them up, but only
+            if the change is big enough for them to matter (RESTART_PENDING_MIN_POINTS); pass [] to ignore them.
 
     Returns:
-        RestartAdvice: The level, the total score and the reasons worth telling the user.
+        RestartAdvice: The tier, the points and the reasons worth telling the user (none in Tier 0).
     """
     distinct: dict[str, RestartImpact] = {}
     for impact in impacts:
         known = distinct.get(impact.label)
-        if known is None or impact.score > known.score:
+        if known is None or impact.points > known.points:
             distinct[impact.label] = impact
-    total = sum(impact.score for impact in distinct.values())
-    if total >= RESTART_STRONG_AT:
-        level = RestartLevel.STRONG
-    elif total >= RESTART_RECOMMENDED_AT or pending_reasons:
-        level = RestartLevel.RECOMMENDED     # a restart that was already pending is enough for "recommended", never more
+    points = sum(impact.points for impact in distinct.values())
+    if points >= RESTART_TIER2_AT:
+        tier = RestartTier.STRONG
+    elif points >= RESTART_TIER1_AT:
+        tier = RestartTier.RECOMMENDED
     else:
-        level = RestartLevel.NONE
-    ordered = sorted((impact for impact in distinct.values() if impact.score > 0), key=lambda impact: -impact.score)
-    reasons = [impact.reason for impact in ordered] + pending_reasons
-    return RestartAdvice(level, total, tuple(reasons) if level is not RestartLevel.NONE else ())
+        tier = RestartTier.NONE
+    pending_applied = False
+    pending_texts: list[str] = []
+    if points >= RESTART_PENDING_MIN_POINTS:
+        found = detect_pending_restart_reasons() if pending_reasons is None else pending_reasons
+        if found:
+            pending_texts = list(found)
+            if tier is not RestartTier.STRONG:
+                tier = RestartTier(int(tier) + 1)
+                pending_applied = True
+    ordered = sorted((impact for impact in distinct.values() if impact.points > 0), key=lambda impact: -impact.points)
+    reasons = [impact.reason for impact in ordered if impact.reason] + pending_texts
+    return RestartAdvice(tier, points, tuple(reasons) if tier is not RestartTier.NONE else (), pending_applied)
 
 
-def assess_clean_restart(report: CleanReport) -> RestartAdvice | None:
+def assess_clean_restart(report: CleanReport, pending_reasons: list[str] | None = None) -> RestartAdvice | None:
     """Restart advice for a finished Clean run; None if nothing was deleted (nothing changed, so nothing to say)."""
     if not report.deleted:
         return None
+    counts: dict[str, int] = {}
+    for entry in report.deleted:
+        counts[entry.category] = counts.get(entry.category, 0) + 1
     impacts: list[RestartImpact] = []
-    for category in {entry.category for entry in report.deleted}:
-        score, reason = CLEAN_RESTART_IMPACT.get(category, (RESTART_SCORE_NONE, ""))
-        impacts.append(RestartImpact(SCAN_CATEGORY_TITLES.get(category, category), score, reason))
-    return assess_restart_need(impacts, detect_pending_restart_reasons())
+    for category, count in counts.items():
+        weight, reason = CLEAN_RESTART_IMPACT.get(category, (RESTART_WEIGHT_LOW, ""))   # a category nobody classified yet is not assumed harmless
+        impacts.append(RestartImpact(SCAN_CATEGORY_TITLES.get(category, category), weight, reason, count))
+    return assess_restart_need(impacts, pending_reasons)
 
 
-def assess_restore_restart(report: RestoreReport) -> RestartAdvice | None:
+def assess_restore_restart(report: RestoreReport, pending_reasons: list[str] | None = None) -> RestartAdvice | None:
     """Restart advice for a finished Restore run; None if nothing was applied."""
     if not report.applied:
         return None
@@ -4354,24 +5364,39 @@ def assess_restore_restart(report: RestoreReport) -> RestartAdvice | None:
         if item.area == AREA_POLICY_LOCKS and item.value_name.lower() in SHELL_READ_POLICY_VALUES:
             impacts.append(CONTROL_PANEL_POLICY_IMPACT)
             continue
-        score, reason = RESTORE_RESTART_IMPACT.get(item.area, (RESTART_SCORE_NONE, ""))
-        impacts.append(RestartImpact(RESTORE_AREA_TITLES.get(item.area, item.area), score, reason))
-    return assess_restart_need(impacts, detect_pending_restart_reasons())
+        weight, reason = RESTORE_RESTART_IMPACT.get(item.area, (RESTART_WEIGHT_NONE, ""))
+        impacts.append(RestartImpact(RESTORE_AREA_TITLES.get(item.area, item.area), weight, reason))
+    return assess_restart_need(impacts, pending_reasons)
 
 
-def assess_import_restart(results: list[ImportResult]) -> RestartAdvice | None:
+def assess_import_restart(results: list[ImportResult], pending_reasons: list[str] | None = None) -> RestartAdvice | None:
     """Restart advice for finished merges; None if no file was merged."""
     merged = [result for result in results if result.succeeded]
     if not merged:
         return None
     impacts = [impact for result in merged for impact in result.restart_impacts]
-    return assess_restart_need(impacts, detect_pending_restart_reasons())
+    return assess_restart_need(impacts, pending_reasons)
 
 
-def format_restart_advice(advice: RestartAdvice) -> str:
-    """Build the restart paragraph of a completion box: the headline, then why (only when a restart is advised)."""
-    lines = [RESTART_HEADLINES[advice.level]]
-    lines.extend(f"  - {reason}" for reason in advice.reasons)
+def format_restart_advice(advice: RestartAdvice | None, include_reasons: bool = True) -> str:
+    """
+    Build the restart paragraph of a completion box.
+
+    Args:
+        advice (RestartAdvice | None): The assessment (None = nothing was changed).
+        include_reasons (bool): Also list why (the Clean Tier 1 note uses the plain sentence only).
+
+    Returns:
+        str: The paragraph - or an EMPTY string in Tier 0 (no banner, not even a "no restart needed" line).
+    """
+    if advice is None:
+        return ""
+    headline = RESTART_HEADLINES.get(advice.tier)
+    if headline is None:
+        return ""
+    lines = [headline]
+    if include_reasons:
+        lines.extend(f"  - {reason}" for reason in advice.reasons)
     return "\n".join(lines)
 
 
@@ -4411,6 +5436,11 @@ def schedule_windows_restart(delay_seconds: int = RESTART_DELAY_SECONDS) -> tupl
 def get_settings_path() -> str:
     """Path of the small JSON settings file (next to the program)."""
     return os.path.join(get_app_dir(), SETTINGS_FILE_NAME)
+
+
+def get_exclusions_path() -> str:
+    """Path of the exclusions file (next to the program, like the settings file)."""
+    return os.path.join(get_app_dir(), EXCLUSIONS_FILE_NAME)
 
 
 def load_settings() -> dict[str, Any]:
@@ -4689,6 +5719,80 @@ def format_accepted_undo_note(messages: list[str]) -> str:
 # MAIN WINDOW
 # =============================================================================
 
+class PreferredSizeSplitter(QSplitter):
+    """A splitter that asks for a sensible height of its own (Qt would add up the children's tiny defaults, which opens the window with a cramped list)."""
+
+    def __init__(self, orientation: Qt.Orientation, preferred_height: int) -> None:
+        """
+        Args:
+            orientation (Qt.Orientation): Direction of the split.
+            preferred_height (int): The height the splitter should ask for when the window is sized.
+        """
+        super().__init__(orientation)
+        self._preferred_height = preferred_height
+
+    def sizeHint(self) -> QSize:
+        """The usual hint, but never less than the preferred height."""
+        base = super().sizeHint()
+        return QSize(base.width(), max(base.height(), self._preferred_height))
+
+
+class PreferredHeightPage(QWidget):
+    """A plain page that asks for a chosen height. Used for the empty state, so the results card is as tall before the first scan as after it."""
+
+    def __init__(self, preferred_height: int) -> None:
+        """
+        Args:
+            preferred_height (int): The height the page should ask for when the window is sized.
+        """
+        super().__init__()
+        self._preferred_height = preferred_height
+
+    def sizeHint(self) -> QSize:
+        """The usual hint, but never less than the preferred height."""
+        base = super().sizeHint()
+        return QSize(base.width(), max(base.height(), self._preferred_height))
+
+
+class ContentScrollArea(QScrollArea):
+    """
+    A frameless scroll area around a tab page.
+
+    The page keeps its natural size when the window has room for it. When the window is smaller (a laptop screen, a high
+    display scaling) scroll bars appear instead of the page forcing the window taller than the screen - so no button is ever
+    out of reach. Qt would normally cap a scroll area's preferred size to a small box; this one reports its content's size.
+    """
+
+    def __init__(self, content: QWidget) -> None:
+        """
+        Args:
+            content (QWidget): The page to show inside.
+        """
+        super().__init__()
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setWidget(content)
+        content.setAutoFillBackground(False)
+        viewport = self.viewport()
+        if viewport is not None:
+            viewport.setAutoFillBackground(False)
+
+    def sizeHint(self) -> QSize:
+        """The content's preferred size (not Qt's capped default), so the window opens big enough to show the whole page."""
+        widget = self.widget()
+        base = widget.sizeHint() if widget is not None else QSize(0, 0)
+        return base + QSize(2 * self.frameWidth(), 2 * self.frameWidth())
+
+    def minimumSizeHint(self) -> QSize:
+        """Small: the page may be scrolled instead of forcing the window to be at least as big as the page."""
+        return QSize(UI_SCROLL_PAGE_MIN_WIDTH, UI_SCROLL_PAGE_MIN_HEIGHT)
+
+
+CLEAN_TREE_HEADERS = ["Status", "Category", "Location", "Issue", "Confidence"]     # columns of the Clean results
+EXCLUSION_TREE_HEADERS = ["Category", "Registry path", "Reason", "Date excluded"]   # columns of the Excluded Items list
+UI_EXCLUSIONS_MIN_HEIGHT = 110
+
+
 class RegistryCleanerWindow(QMainWindow):
     """
     Main window with four tabs (Clean, Backup, Restore Defaults, Import .reg) that share one progress bar.
@@ -4720,12 +5824,25 @@ class RegistryCleanerWindow(QMainWindow):
         # Findings whose undo backup failed the safety check (this session only). It must exist BEFORE init_ui(),
         # because building the result tree consults it to decide which rows start unticked.
         self.undo_failures = UndoFailureTracker()
+        # Everything below must exist BEFORE init_ui() as well (the widgets are filled from it).
+        self.exclusions = ExclusionStore()                    # findings the user chose to keep: they only change what is SHOWN
+        self.all_findings: list[BrokenEntry] = []            # everything the last scan found, hidden by exclusions or not
+        self.hidden_by_exclusions = 0                        # how many of them the exclusions currently hide
+        self.scan_state = "idle"                             # "idle" (nothing scanned yet) | "scanning" | "done"
+        self.last_scan_text = ""                             # the 'Last scan' line of the Cleanup Summary card
+        self.last_clean_text = ""                            # the 'Last cleanup' line of the Cleanup Summary card
+        self.exclusion_rows: list[ExclusionRecord] = []      # the records behind the rows of the Excluded Items list
+        self._open_notices: list[QMessageBox] = []           # non-modal notes that are still on screen (keeps them alive)
+        # The start-up safety self-check: if a CRITICAL part (allow-list, delete guards, undo writer) fails, cleaning is disabled.
+        self.safety_report = run_safety_self_check(self.backup_root, self.exclusions)
+        self.cleaning_blocked = self.safety_report.has_critical_failure
         self.init_ui()
+        QTimer.singleShot(0, self.show_startup_notices)       # warnings (damaged exclusions file, failed self-check) once the window is up
         log("[INIT] RegistryCleanerWindow initialization complete")
 
     # ------------------------------------------------------------------ construction
     def init_ui(self) -> None:
-        """Build all widgets, then size the window to fit them, lock that size and centre it on the screen."""
+        """Build all widgets, then size the window to fit them (never larger than the screen) and centre it."""
         log("[UI] Initializing user interface components...")
         self.setWindowTitle(APP_WINDOW_TITLE)
         icon_path = resource_path(ICON_FILE_NAME)
@@ -4740,6 +5857,7 @@ class RegistryCleanerWindow(QMainWindow):
         root_layout.setContentsMargins(UI_WINDOW_MARGIN, UI_WINDOW_MARGIN, UI_WINDOW_MARGIN, UI_WINDOW_MARGIN)
         root_layout.setSpacing(UI_LAYOUT_SPACING)
         root_layout.addLayout(self.build_header())
+        root_layout.addWidget(self.build_safety_banner())
         self.tabs = QTabWidget()
         self.clean_page = self.build_clean_tab()
         self.backup_page = self.build_backup_tab()
@@ -4756,14 +5874,27 @@ class RegistryCleanerWindow(QMainWindow):
         self.refresh_button_states()
         self.update_log_button_states()
         # Apply the stylesheet and fonts to every widget NOW: size hints measured before that are slightly too small,
-        # which would make the locked window a few pixels shorter than its content wants.
+        # which would make the window a few pixels shorter than its content wants.
         for widget in self.findChildren(QWidget):
             widget.ensurePolished()
         self.ensurePolished()
         self.adjustSize()                       # let the layouts decide how big everything needs to be ...
-        self.setFixedSize(self.sizeHint())      # ... then lock that size (no resizing)
+        self.apply_initial_window_size()        # ... open at that size (but never larger than the screen); the window is resizable
         self.center_window()
         log("[UI] User interface initialization complete")
+
+    def apply_initial_window_size(self) -> None:
+        """Open at the size the content wants, capped to the usable screen. The window can be resized (the results list grows with it)."""
+        hint = self.sizeHint()
+        minimum = self.minimumSizeHint()
+        width, height = hint.width() + UI_SCROLLBAR_ALLOWANCE, hint.height()    # room for the scroll bar a tall page may show
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            width = min(width, int(area.width() * UI_SCREEN_FRACTION))
+            height = min(height, int(area.height() * UI_SCREEN_FRACTION))
+        self.setMinimumSize(min(minimum.width(), width), min(minimum.height(), height))
+        self.resize(width, height)
 
     def center_window(self) -> None:
         """Move the window to the middle of the usable screen area (the area without the taskbar)."""
@@ -4792,6 +5923,118 @@ class RegistryCleanerWindow(QMainWindow):
         layout.addWidget(self.restart_admin_button)
         return layout
 
+    def build_safety_banner(self) -> QFrame:
+        """
+        Build the slim trust banner under the header: the safety guarantees plus the live Safety Status.
+
+        The ticks are not decoration: each one is switched off (and turns amber or red) when the start-up self-check could
+        not prove it. "Review Before Deletion" is a property of the workflow itself - nothing is ever deleted unreviewed.
+        """
+        banner = QFrame()
+        banner.setObjectName("safetyBanner")
+        row = QHBoxLayout(banner)
+        row.setContentsMargins(UI_CARD_PADDING + 2, 6, UI_CARD_PADDING + 2, 6)
+        row.setSpacing(UI_LAYOUT_SPACING * 2)
+        self.safety_chips: dict[str, QLabel] = {}
+        for key in ("allowlist", "undo", "review"):
+            chip = QLabel()
+            chip.setObjectName("safetyChip")
+            self.safety_chips[key] = chip
+            row.addWidget(chip)
+        row.addStretch(1)
+        self.safety_status_label = QLabel()
+        self.safety_status_label.setObjectName("safetyStatus")
+        row.addWidget(self.safety_status_label)
+        self.safety_banner = banner
+        self.refresh_safety_status()
+        return banner
+
+    @staticmethod
+    def set_state_property(widget: QWidget, state: str) -> None:
+        """Set the stylesheet property "state" ("good" / "warn" / "bad") and make the stylesheet re-evaluate the widget."""
+        if widget.property("state") == state:
+            return
+        widget.setProperty("state", state)
+        style = widget.style()
+        if style is not None:
+            style.unpolish(widget)
+            style.polish(widget)
+        widget.update()
+
+    @staticmethod
+    def mark_workflow_button(button: QPushButton, primary: bool, danger: bool = False) -> None:
+        """
+        Style a button as one of the two workflow buttons: the PRIMARY (accent-coloured) one is the next step to take.
+
+        Args:
+            button (QPushButton): Analyze or Clean Selected.
+            primary (bool): True = filled accent button, False = normal button.
+            danger (bool): True = the button deletes things; while it is not primary it gets a red outline.
+        """
+        if button.property("primary") == primary and button.property("workflow") is True:
+            return
+        button.setProperty("workflow", True)
+        button.setProperty("primary", primary)
+        button.setProperty("danger", danger)
+        style = button.style()
+        if style is not None:
+            style.unpolish(button)
+            style.polish(button)
+        button.update()
+
+    def make_card(self, title: str) -> tuple[QFrame, QVBoxLayout, QHBoxLayout]:
+        """
+        Create a card: a softly bordered, rounded panel with a title line.
+
+        Returns:
+            tuple: (the card, its vertical body layout - add content below the title -, the title row - add buttons or
+                numbers to its right end).
+        """
+        card = QFrame()
+        card.setObjectName("card")
+        body = QVBoxLayout(card)
+        body.setContentsMargins(UI_CARD_PADDING, UI_CARD_PADDING - 2, UI_CARD_PADDING, UI_CARD_PADDING)
+        body.setSpacing(UI_LAYOUT_SPACING)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(UI_LAYOUT_SPACING)
+        title_label = QLabel(title)
+        title_label.setObjectName("cardTitle")
+        title_row.addWidget(title_label)
+        title_row.addStretch(1)
+        body.addLayout(title_row)
+        return card, body, title_row
+
+    def make_stat_block(self, caption: str, tooltip: str) -> tuple[QWidget, QLabel]:
+        """One number of the statistics bar with its caption underneath. Returns (block, the number's label)."""
+        block = QWidget()
+        column = QVBoxLayout(block)
+        column.setContentsMargins(UI_LAYOUT_SPACING + 2, 0, UI_LAYOUT_SPACING + 2, 0)
+        column.setSpacing(0)
+        value = QLabel("0")
+        value.setObjectName("statValue")
+        value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        caption_label = QLabel(caption)
+        caption_label.setObjectName("statCaption")
+        caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(value)
+        column.addWidget(caption_label)
+        block.setToolTip(tooltip)
+        return block, value
+
+    def make_status_pair(self, caption: str) -> tuple[QWidget, QLabel]:
+        """A 'Caption  value' pair for the System Status card. Returns (the pair, the value's label)."""
+        pair = QWidget()
+        row = QHBoxLayout(pair)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(UI_LAYOUT_SPACING // 2)
+        caption_label = QLabel(f"{caption}:")
+        caption_label.setObjectName("cardHint")
+        value = QLabel("")
+        value.setObjectName("cardValue")
+        row.addWidget(caption_label)
+        row.addWidget(value, 1)
+        return pair, value
+
     def _new_tab_layout(self, page: QWidget) -> QVBoxLayout:
         """Create the standard layout (margins + spacing) for a tab page."""
         layout = QVBoxLayout(page)
@@ -4799,7 +6042,8 @@ class RegistryCleanerWindow(QMainWindow):
         layout.setSpacing(UI_LAYOUT_SPACING)
         return layout
 
-    def _configure_tree(self, tree: QTreeWidget, headers: list[str], fixed_chars: dict[int, int]) -> None:
+    def _configure_tree(self, tree: QTreeWidget, headers: list[str], fixed_chars: dict[int, int],
+                        min_height: int = UI_RESULTS_MIN_HEIGHT) -> None:
         """
         Apply the shared look of the result trees: minimum size, elided text and column widths.
 
@@ -4808,6 +6052,7 @@ class RegistryCleanerWindow(QMainWindow):
             headers (list[str]): Column titles.
             fixed_chars (dict[int, int]): Columns with a fixed width, as {column: width in average characters}.
                 All other columns share the remaining space.
+            min_height (int): Smallest height of the tree.
         """
         char_width = tree.fontMetrics().averageCharWidth()          # the real font decides how wide a "character" is
         fixed_widths = {column: chars * char_width for column, chars in fixed_chars.items()}
@@ -4815,7 +6060,7 @@ class RegistryCleanerWindow(QMainWindow):
         needed_width = (sum(fixed_widths.values()) + flexible_columns * UI_STRETCH_COLUMN_MIN_CHARS * char_width
                         + UI_SCROLLBAR_ALLOWANCE)
         tree.setHeaderLabels(headers)
-        tree.setMinimumSize(max(UI_RESULTS_MIN_WIDTH, needed_width), UI_RESULTS_MIN_HEIGHT)
+        tree.setMinimumSize(max(UI_RESULTS_MIN_WIDTH, needed_width), min_height)
         tree.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         tree.setUniformRowHeights(True)
         tree.setAlternatingRowColors(True)
@@ -4829,59 +6074,226 @@ class RegistryCleanerWindow(QMainWindow):
             tree.setColumnWidth(column, width)
 
     def build_clean_tab(self) -> QWidget:
-        """Build the Clean tab: category checkboxes, Analyze, the results list and the Clean button."""
+        """
+        Build the Clean tab as four cards - Scan Categories, Scan Results (with statistics, the review panel and the
+        list), Cleanup Summary, System Status - plus the collapsible Excluded Items section at the bottom.
+        """
         page = QWidget()
         layout = self._new_tab_layout(page)
-        description = QLabel("Finds registry entries that point to files or folders that no longer exist. Nothing is "
-                             "deleted until you review the list and confirm - an undo backup is saved first. Remembered network locations that "
-                             "can stall Explorer are listed too, but unticked: they may be history you made on purpose.")
-        description.setWordWrap(True)
-        description.setObjectName("mutedLabel")
-        layout.addWidget(description)
 
-        group = QGroupBox("What to scan")
-        grid = QGridLayout(group)
-        grid.setSpacing(UI_LAYOUT_SPACING)
+        # ---- card 1: Scan Categories ------------------------------------------------------------------------------
+        scan_card, scan_body, scan_title_row = self.make_card("Scan Categories")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(UI_LAYOUT_SPACING * 2)
+        grid.setVerticalSpacing(UI_LAYOUT_SPACING // 2 + 2)
         self.category_checkboxes: dict[str, QCheckBox] = {}
         rows_per_column = (len(SCAN_CATEGORIES) + UI_CATEGORY_COLUMNS - 1) // UI_CATEGORY_COLUMNS
         for index, category in enumerate(SCAN_CATEGORIES):
-            checkbox = QCheckBox(category.title)
+            checkbox = QCheckBox(f"{CATEGORY_ICONS.get(category.key, '')}  {category.title}".strip())
             checkbox.setChecked(True)
             checkbox.setToolTip(category.tooltip)
             self.category_checkboxes[category.key] = checkbox
             grid.addWidget(checkbox, index % rows_per_column, index // rows_per_column)
-        layout.addWidget(group)
-
-        button_row = QHBoxLayout()
+        scan_body.addLayout(grid)
         self.select_all_categories_button = make_button("Select All ✔️", tooltip="Tick every category.")
         self.select_all_categories_button.clicked.connect(self.on_select_all_categories)
-        self.analyze_button = make_button("Analyze 🔍", "primaryButton", "Scans the ticked categories. Nothing is changed.")
+        self.analyze_button = make_button("Analyze 🔍", tooltip="Scans the ticked categories. Nothing is changed.")
         self.analyze_button.clicked.connect(self.on_analyze_clicked)
-        button_row.addWidget(self.select_all_categories_button)
-        button_row.addStretch(1)
-        button_row.addWidget(self.analyze_button)
-        layout.addLayout(button_row)
+        self.mark_workflow_button(self.analyze_button, primary=True)       # the first step: scan
+        scan_title_row.addWidget(self.select_all_categories_button)
+        scan_title_row.addWidget(self.analyze_button)
+        layout.addWidget(scan_card)
 
-        self.clean_tree = QTreeWidget()
-        self._configure_tree(self.clean_tree, ["Entry", "Problem"], {1: UI_COLUMN_PROBLEM_CHARS})
-        self.clean_tree.itemChanged.connect(self.on_clean_item_changed)
-        layout.addWidget(self.clean_tree)
-
-        bottom_row = QHBoxLayout()
-        self.clean_summary_label = QLabel("Press Analyze to look for broken entries.")
+        # ---- card 2: Scan Results -------------------------------------------------------------------------------------
+        results_card, results_body, results_title_row = self.make_card("Scan Results")
+        self.stat_labels: dict[str, QLabel] = {}
+        stat_specs = (
+            ("findings", "Findings", "Findings in the list. Findings you excluded are not counted."),
+            ("selected", "Selected", "Findings that are ticked: these are cleaned when you press Clean Selected."),
+            ("categories", "Cleanup Categories", "Kinds of findings in the list."),
+            ("exclusions", "Exclusions", "Findings you chose to keep. They are hidden from the results but still scanned."),
+        )
+        for position, (key, caption, tip) in enumerate(stat_specs):
+            if position:
+                divider = QFrame()
+                divider.setObjectName("statDivider")
+                divider.setFixedWidth(1)
+                results_title_row.addWidget(divider)
+            block, value_label = self.make_stat_block(caption, tip)
+            self.stat_labels[key] = value_label
+            results_title_row.addWidget(block)
+        self.results_stack = QStackedWidget()
+        self.results_stack.addWidget(self.build_empty_state_page())        # index 0: nothing to show (yet)
+        self.results_stack.addWidget(self.build_results_splitter())        # index 1: the list + the review panel
+        results_body.addWidget(self.results_stack, 1)
+        actions = QHBoxLayout()
+        actions.setSpacing(UI_LAYOUT_SPACING)
         self.check_all_clean_button = make_button("Check All", tooltip=("Ticks every found entry except the ⚠ ones, which need your individual "
                                                                         f"review, and the {UI_UNDO_FAILED_MARKER} ones, whose undo backup failed the safety check."))
         self.check_all_clean_button.clicked.connect(lambda: self.set_all_clean_checks(Qt.CheckState.Checked))
         self.uncheck_all_clean_button = make_button("Uncheck All", tooltip="Untick every found entry.")
         self.uncheck_all_clean_button.clicked.connect(lambda: self.set_all_clean_checks(Qt.CheckState.Unchecked))
-        self.clean_button = make_button("Clean Selected 🧹", "dangerButton", "Deletes the ticked entries after saving an undo backup.")
+        self.add_exclusion_button = make_button(
+            "Add to Exclusions 🚫",
+            tooltip=("Click findings in the list to highlight them (Ctrl or Shift for several), then press this to keep them: they are "
+                     "hidden from future results. Nothing is deleted, and the scan still checks them."))
+        self.add_exclusion_button.clicked.connect(self.on_add_exclusions_clicked)
+        actions.addWidget(self.check_all_clean_button)
+        actions.addWidget(self.uncheck_all_clean_button)
+        actions.addWidget(self.add_exclusion_button)
+        actions.addStretch(1)
+        results_body.addLayout(actions)
+        layout.addWidget(results_card, 1)
+
+        # ---- cards 3 + 4: Cleanup Summary and System Status, side by side ------------------------------------------
+        lower_row = QHBoxLayout()
+        lower_row.setSpacing(UI_LAYOUT_SPACING)
+        summary_card, summary_body, summary_title_row = self.make_card("Cleanup Summary")
+        self.clean_summary_label = QLabel("")
+        self.clean_summary_label.setObjectName("cardValue")
+        self.clean_impact_label = QLabel("")
+        self.clean_impact_label.setObjectName("cardHint")
+        self.clean_impact_label.setWordWrap(True)
+        self.last_run_label = QLabel("")
+        self.last_run_label.setObjectName("cardHint")
+        self.last_run_label.setWordWrap(True)
+        self.last_run_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.clean_button = make_button("Clean Selected 🧹", tooltip="Deletes the ticked entries after saving an undo backup.")
         self.clean_button.clicked.connect(self.on_clean_clicked)
-        bottom_row.addWidget(self.clean_summary_label, 1)
-        bottom_row.addWidget(self.check_all_clean_button)
-        bottom_row.addWidget(self.uncheck_all_clean_button)
-        bottom_row.addWidget(self.clean_button)
-        layout.addLayout(bottom_row)
+        self.mark_workflow_button(self.clean_button, primary=False, danger=True)
+        summary_title_row.addWidget(self.clean_button)
+        summary_body.addWidget(self.clean_summary_label)
+        summary_body.addWidget(self.clean_impact_label)
+        summary_body.addWidget(self.last_run_label)
+        summary_body.addStretch(1)
+        lower_row.addWidget(summary_card, 1)
+
+        status_card, status_body, _status_title_row = self.make_card("System Status")
+        self.status_values: dict[str, QLabel] = {}
+        status_grid = QGridLayout()
+        status_grid.setHorizontalSpacing(UI_LAYOUT_SPACING * 2)
+        status_grid.setVerticalSpacing(UI_LAYOUT_SPACING // 2)
+        for position, (key, caption) in enumerate((("safety", "Safety Status"), ("admin", "Admin"), ("exclusions", "Exclusions"),
+                                                   ("restart", "Restart"), ("backup", "Backup folder"))):
+            pair, value_label = self.make_status_pair(caption)
+            self.status_values[key] = value_label
+            if key == "backup":
+                status_grid.addWidget(pair, position // 2, 0, 1, 2)
+            else:
+                status_grid.addWidget(pair, position // 2, position % 2)
+        status_body.addLayout(status_grid)
+        status_body.addStretch(1)
+        lower_row.addWidget(status_card, 1)
+        layout.addLayout(lower_row)
+
+        # ---- Excluded Items (collapsed) ------------------------------------------------------------------------------
+        layout.addWidget(self.build_exclusions_section())
+        self.refresh_system_status()
+        self.update_clean_summary()
+        self.update_results_view()
+        return ContentScrollArea(page)
+
+    def build_empty_state_page(self) -> QWidget:
+        """The page shown instead of a blank list: an icon, a heading and one helpful sentence (see update_results_view)."""
+        page = PreferredHeightPage(UI_CLEAN_LIST_START_HEIGHT + UI_DETAILS_START_HEIGHT + 30)    # same height as the results view
+        column = QVBoxLayout(page)
+        column.setSpacing(UI_LAYOUT_SPACING)
+        column.addStretch(1)
+        self.empty_icon = QLabel()
+        self.empty_icon.setObjectName("emptyIcon")
+        self.empty_title = QLabel()
+        self.empty_title.setObjectName("emptyTitle")
+        self.empty_text = QLabel()
+        self.empty_text.setObjectName("emptyText")
+        # No automatic word-wrapping here: a wrapping label makes Qt size the whole stacked area by "height for width",
+        # which ignores the preferred height above. The messages are short and wrapped by hand (\n) instead.
+        for label in (self.empty_icon, self.empty_title, self.empty_text):
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            column.addWidget(label)
+        column.addStretch(1)
+        page.setMinimumHeight(UI_CLEAN_RESULTS_MIN_HEIGHT)
         return page
+
+    def build_results_splitter(self) -> QSplitter:
+        """The results list on top and the review panel under it, with a draggable divider (the panel can be collapsed)."""
+        self.clean_tree = QTreeWidget()
+        self._configure_tree(self.clean_tree, CLEAN_TREE_HEADERS,
+                             {0: UI_COLUMN_STATUS_CHARS, 1: UI_COLUMN_CATEGORY_CHARS, 4: UI_COLUMN_CONFIDENCE_CHARS},
+                             UI_CLEAN_RESULTS_MIN_HEIGHT)
+        self.clean_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)    # Ctrl/Shift-click to highlight several
+        self.clean_tree.itemChanged.connect(self.on_clean_item_changed)
+        self.clean_tree.itemSelectionChanged.connect(self.refresh_button_states)
+        self.clean_tree.currentItemChanged.connect(self.on_clean_current_changed)
+
+        review = QWidget()
+        review_layout = QVBoxLayout(review)
+        review_layout.setContentsMargins(0, 2, 0, 0)
+        review_layout.setSpacing(4)
+        review_title = QLabel("Cleanup Review")
+        review_title.setObjectName("cardValue")
+        self.details_view = QTextBrowser()
+        self.details_view.setOpenLinks(False)
+        self.details_view.setMinimumHeight(UI_DETAILS_MIN_HEIGHT)
+        review_layout.addWidget(review_title)
+        review_layout.addWidget(self.details_view, 1)
+
+        splitter = PreferredSizeSplitter(Qt.Orientation.Vertical, UI_CLEAN_LIST_START_HEIGHT + UI_DETAILS_START_HEIGHT + 30)
+        splitter.addWidget(self.clean_tree)
+        splitter.addWidget(review)
+        splitter.setStretchFactor(0, 5)       # extra height goes to the list ...
+        splitter.setStretchFactor(1, 2)       # ... and a smaller share to the review panel
+        splitter.setSizes([UI_CLEAN_LIST_START_HEIGHT, UI_DETAILS_START_HEIGHT])
+        splitter.setChildrenCollapsible(True)
+        self.results_splitter = splitter
+        self.show_finding_details(None)
+        return splitter
+
+    def build_exclusions_section(self) -> QWidget:
+        """The collapsible 'Excluded Items (N)' section at the bottom of the Clean tab (collapsed by default)."""
+        wrapper = QWidget()
+        box = QVBoxLayout(wrapper)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(UI_LAYOUT_SPACING // 2)
+        self.exclusions_toggle = QToolButton()
+        self.exclusions_toggle.setObjectName("sectionToggle")
+        self.exclusions_toggle.setCheckable(True)
+        self.exclusions_toggle.setChecked(False)
+        self.exclusions_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.exclusions_toggle.setToolTip("Findings you chose to keep. They are hidden from the results, but they are still scanned.")
+        self.exclusions_toggle.toggled.connect(self.on_exclusions_toggled)
+        box.addWidget(self.exclusions_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+
+        panel = QFrame()
+        panel.setObjectName("card")
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(UI_CARD_PADDING, UI_CARD_PADDING - 2, UI_CARD_PADDING, UI_CARD_PADDING)
+        panel_layout.setSpacing(UI_LAYOUT_SPACING)
+        hint = QLabel("These findings are hidden from the scan results but are still scanned, and nothing about them is ever cleaned "
+                      "automatically. Highlight rows (Ctrl or Shift for several) and remove them to see those findings again - "
+                      "they come back unticked.")
+        hint.setObjectName("cardHint")
+        hint.setWordWrap(True)
+        panel_layout.addWidget(hint)
+        self.exclusions_tree = QTreeWidget()
+        self._configure_tree(self.exclusions_tree, EXCLUSION_TREE_HEADERS, {0: UI_COLUMN_CATEGORY_CHARS, 3: UI_COLUMN_DATE_CHARS}, UI_EXCLUSIONS_MIN_HEIGHT)
+        self.exclusions_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.exclusions_tree.itemSelectionChanged.connect(self.refresh_button_states)
+        panel_layout.addWidget(self.exclusions_tree)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(UI_LAYOUT_SPACING)
+        self.remove_exclusions_button = make_button("Remove Selected", tooltip="Stops hiding the highlighted findings.")
+        self.remove_exclusions_button.clicked.connect(self.on_remove_selected_exclusions)
+        self.remove_all_exclusions_button = make_button("Remove All", tooltip="Empties the exclusion list (asks first).")
+        self.remove_all_exclusions_button.clicked.connect(self.on_remove_all_exclusions)
+        buttons.addWidget(self.remove_exclusions_button)
+        buttons.addWidget(self.remove_all_exclusions_button)
+        buttons.addStretch(1)
+        panel_layout.addLayout(buttons)
+        panel.setVisible(False)
+        self.exclusions_panel = panel
+        box.addWidget(panel)
+        self.refresh_exclusions_panel()
+        return wrapper
 
     def build_backup_tab(self) -> QWidget:
         """Build the Backup tab: folder chooser and the one-click full backup button."""
@@ -5062,8 +6474,18 @@ class RegistryCleanerWindow(QMainWindow):
         has_clean_results = bool(self.found_entries)
         self.check_all_clean_button.setEnabled(idle and has_clean_results)
         self.uncheck_all_clean_button.setEnabled(idle and has_clean_results)
-        self.clean_button.setEnabled(can_write and self.count_checked(self.clean_tree) > 0)
-        self.clean_button.setToolTip(admin_hint or "Deletes the ticked entries after saving an undo backup.")
+        ready_to_clean = self.is_admin and not self.cleaning_blocked and self.count_checked(self.clean_tree) > 0
+        self.clean_button.setEnabled(idle and ready_to_clean)
+        if self.cleaning_blocked:
+            self.clean_button.setToolTip("Cleaning is disabled: the start-up safety self-check failed (see Safety Status).")
+        else:
+            self.clean_button.setToolTip(admin_hint or "Deletes the ticked entries after saving an undo backup.")
+        self.add_exclusion_button.setEnabled(idle and bool(self.clean_tree.selectedItems()))
+        self.remove_exclusions_button.setEnabled(idle and bool(self.exclusions_tree.selectedItems()))
+        self.remove_all_exclusions_button.setEnabled(idle and len(self.exclusions) > 0)
+        # The accent colour marks the NEXT step: Analyze until there is a selection to clean, then Clean Selected.
+        self.mark_workflow_button(self.clean_button, primary=ready_to_clean, danger=True)
+        self.mark_workflow_button(self.analyze_button, primary=not ready_to_clean)
 
         self.browse_backup_button.setEnabled(idle)
         self.open_backup_button.setEnabled(idle)
@@ -5100,27 +6522,58 @@ class RegistryCleanerWindow(QMainWindow):
         """Show a warning box."""
         QMessageBox.warning(self, title, text)
 
+    def show_notice(self, title: str, text: str, warning: bool = False) -> QMessageBox:
+        """
+        Show a NON-MODAL note with a single OK button: it never blocks the window, asks nothing and schedules nothing.
+
+        Args:
+            title (str): Box title.
+            text (str): The note.
+            warning (bool): True for the warning icon.
+
+        Returns:
+            QMessageBox: The box (it deletes itself when closed).
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning if warning else QMessageBox.Icon.Information)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setModal(False)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._open_notices.append(box)
+        box.finished.connect(lambda _result, notice=box: self._open_notices.remove(notice) if notice in self._open_notices else None)
+        box.show()
+        return box
+
     def show_finished_box(self, title: str, text: str, advice: RestartAdvice | None, warning: bool = False) -> None:
         """
-        Show the "... finished" box; when a restart is advised it also offers "Restart Now" / "Restart Later".
+        Show the "... finished" box, adding as little about restarting as the tier allows.
+
+        Tier 0 (or no advice): the plain result, no word about restarting.
+        Tier 1: the result plus one calm sentence - non-modal, OK only, nothing is scheduled.
+        Tier 2: the result plus "Restart Now" / "Restart Later".
 
         Args:
             title (str): Box title.
             text (str): What the operation did.
-            advice (RestartAdvice | None): None = nothing changed (no restart paragraph at all).
+            advice (RestartAdvice | None): None = nothing changed.
             warning (bool): True to use the warning look when no restart is offered (the operation had problems).
         """
-        if advice is None:
+        tier = RestartTier.NONE if advice is None else advice.tier
+        if advice is None or tier is RestartTier.NONE:
             (self.show_warning if warning else self.show_info)(title, text)
             return
         full_text = f"{text}\n\n{format_restart_advice(advice)}"
-        if not advice.needs_restart:
-            (self.show_warning if warning else self.show_info)(title, full_text)
+        if tier is RestartTier.RECOMMENDED:
+            self.show_notice(title, full_text, warning)
             return
         full_text += (f"\n\n'Restart Now' starts a {RESTART_DELAY_SECONDS}-second countdown, so save your work in other programs first. "
                       "You can cancel the countdown with 'shutdown /a' in a Command Prompt.")
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Warning if warning or advice.level is RestartLevel.STRONG else QMessageBox.Icon.Information)
+        box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle(title)
         box.setText(full_text)
         now_button = make_button("Restart Now", tooltip=f"Restarts Windows after a {RESTART_DELAY_SECONDS}-second countdown.")
@@ -5209,6 +6662,9 @@ class RegistryCleanerWindow(QMainWindow):
         if worker is not None:
             worker.wait(2000)   # the thread is already leaving run(); this only lets it finish tearing down
         self.worker = None
+        if self.scan_state == "scanning":
+            self.scan_state = "idle"            # the scan ended without results (cancelled or failed); on success its handler sets "done" next
+            self.update_results_view()
         self.refresh_button_states()
         self.update_log_button_states()
 
@@ -5279,27 +6735,60 @@ class RegistryCleanerWindow(QMainWindow):
             self.show_info("Nothing to scan", "Tick at least one category first.")
             return
         self.found_entries = []
+        self.all_findings = []
+        self.hidden_by_exclusions = 0
+        self.scan_state = "scanning"
         self.populate_clean_tree()
         self.update_clean_summary()
-        self.start_task(lambda reporter: RegistryScanner(reporter).scan(categories), "Scan", self.on_scan_finished)
+        self.update_results_view()
 
-    def on_scan_finished(self, entries: list[BrokenEntry]) -> None:
-        """Show the scan results in the tree."""
-        self.found_entries = entries
+        def scan_task(reporter: ProgressReporter) -> ScanOutcome:
+            started = time.perf_counter()
+            findings = RegistryScanner(reporter).scan(categories)       # the scan itself knows nothing about exclusions
+            return ScanOutcome(findings, time.perf_counter() - started, len(categories))
+
+        self.start_task(scan_task, "Scan", self.on_scan_finished)
+
+    def on_scan_finished(self, outcome: ScanOutcome) -> None:
+        """
+        Show the scan results.
+
+        The scan has already looked at EVERYTHING. Only now are the user's exclusions applied - to the finished list, and
+        only to what is shown. Nothing is re-checked, ticked or deleted here.
+        """
+        self.all_findings = list(outcome.findings)
+        visible, hidden = self.exclusions.partition(self.all_findings)
+        self.found_entries = visible
+        self.hidden_by_exclusions = len(hidden)
+        self.scan_state = "done"
         self.populate_clean_tree()
         self.update_clean_summary()
+        self.update_results_view()
         self.refresh_button_states()
-        if entries:
-            self.set_status(f"Scan finished: {plural(len(entries), 'entry', 'entries')} found. Review the list, then press Clean.")
+        by_category: dict[str, int] = {}
+        for entry in self.all_findings:
+            by_category[f"found_{entry.category}"] = by_category.get(f"found_{entry.category}", 0) + 1
+        log_telemetry("scan", seconds=outcome.seconds, categories_scanned=outcome.categories_scanned,
+                      findings=len(self.all_findings), shown=len(visible), hidden_by_exclusions=len(hidden), **by_category)
+        self.last_scan_text = f"Last scan: {plural(len(visible), 'finding', 'findings')} in {outcome.seconds:.1f} s"
+        self.refresh_last_run_label()
+        if visible:
+            self.set_status(f"Scan finished: {plural(len(visible), 'finding', 'findings')}. Review the list, then press Clean Selected.")
+        elif hidden:
+            self.set_status("Scan finished: nothing to show - everything found is on your exclusion list.")
         else:
             self.set_status("Scan finished: nothing found ✅")
 
-    def populate_clean_tree(self) -> None:
+    def populate_clean_tree(self, tick_overrides: dict[EntryIdentity, bool] | None = None) -> None:
         """
         Fill the results tree from self.found_entries, grouped by category.
 
         Everything starts ticked except entries that need a deliberate decision: possible user history (⚠) and
         entries whose undo backup already failed the safety check earlier in this session (⛔).
+
+        Args:
+            tick_overrides (dict | None): {finding identity: ticked?} to keep the user's own ticks when the list is rebuilt
+                (after excluding findings, removing exclusions or a clean). A finding that is not in it gets the default.
         """
         tree = self.clean_tree
         tree.blockSignals(True)
@@ -5310,42 +6799,62 @@ class RegistryCleanerWindow(QMainWindow):
         for index, entry in enumerate(self.found_entries):
             parent = parents.get(entry.category)
             if parent is None:
-                parent = QTreeWidgetItem(tree, [SCAN_CATEGORY_TITLES.get(entry.category, entry.category), ""])
+                parent = QTreeWidgetItem(tree, [""] * len(CLEAN_TREE_HEADERS))
                 parent.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
                 parent.setData(0, Qt.ItemDataRole.UserRole, entry.category)   # lets 'Check All' recognise review-first groups
+                parent.setFirstColumnSpanned(True)                            # a group row is a heading across all columns
                 parents[entry.category] = parent
             if entry.review_first:
                 self.review_first_categories.add(entry.category)
-            child = QTreeWidgetItem(parent, [self.build_clean_row_label(entry), entry.reason])
+            child = QTreeWidgetItem(parent, [""] * len(CLEAN_TREE_HEADERS))
             child.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
             # Entries that may be deliberate user history, or that already failed the undo check, start UNTICKED.
             needs_decision = entry.review_first or self.undo_failures.has_failed(entry)
-            child.setCheckState(0, Qt.CheckState.Unchecked if needs_decision else Qt.CheckState.Checked)
+            checked = not needs_decision
+            if tick_overrides is not None and entry.identity in tick_overrides:
+                checked = tick_overrides[entry.identity]
+            child.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             child.setData(0, Qt.ItemDataRole.UserRole, index)
-            child.setToolTip(0, self.build_clean_row_tooltip(entry))
-            child.setToolTip(1, entry.reason)
+            self.fill_clean_row(child, entry)
         for category_key, parent in parents.items():
-            parent.setText(0, f"{SCAN_CATEGORY_TITLES.get(category_key, category_key)} ({parent.childCount()})")
+            title = SCAN_CATEGORY_TITLES.get(category_key, category_key)
+            icon = CATEGORY_ICONS.get(category_key, "")
+            parent.setText(0, f"{icon}  {title} ({parent.childCount()})".strip())
             parent.setExpanded(True)          # the group's own check state is derived from its rows (partly ticked, ...)
         tree.setUpdatesEnabled(True)
         tree.blockSignals(False)
+        self.show_finding_details(None)       # the rows the panel was showing no longer exist
 
-    def build_clean_row_label(self, entry: BrokenEntry) -> str:
-        """
-        Text of a result row's first column: the location, prefixed by the markers that apply to it.
-
-        Args:
-            entry (BrokenEntry): The finding shown in the row.
-
-        Returns:
-            str: The location, e.g. "⛔ ⚠ HKCU\\Software\\..." (⛔ = its undo backup failed the safety check, ⚠ = review first).
-        """
-        markers = ""
+    def build_status_text(self, entry: BrokenEntry) -> str:
+        """Text of the Status column: 'Ready', or the markers that apply (⛔ undo check failed, ⚠ review first)."""
+        parts: list[str] = []
         if self.undo_failures.has_failed(entry):
-            markers += f"{UI_UNDO_FAILED_MARKER} "
+            parts.append(f"{UI_UNDO_FAILED_MARKER} Undo failed")
         if entry.review_first:
-            markers += "⚠ "
-        return f"{markers}{entry.display_location}"
+            parts.append("⚠ Review")
+        return " · ".join(parts) if parts else "Ready"
+
+    def fill_clean_row(self, row: QTreeWidgetItem, entry: BrokenEntry) -> None:
+        """Set the text, colour and tooltip of every column of one result row (the tick is not touched)."""
+        confidence = assess_confidence(entry)
+        row.setText(0, self.build_status_text(entry))
+        row.setText(1, f"{CATEGORY_ICONS.get(entry.category, '')} {CATEGORY_SHORT_NAMES.get(entry.category, entry.category)}".strip())
+        row.setText(2, entry.display_location)
+        row.setText(3, entry.reason)
+        row.setText(4, confidence.value)
+        row.setForeground(4, QBrush(QColor(CONFIDENCE_COLORS[confidence])))
+        notes: list[str] = []
+        failures = self.undo_failures.failure_count(entry)
+        if failures:
+            notes.append(f"{UI_UNDO_FAILED_MARKER} Its undo backup failed the safety check {plural(failures, 'time', 'times')}, "
+                         "so it was unticked. Tick it yourself to try again.")
+        if entry.review_first:
+            notes.append("⚠ This may be history you created on purpose, so it is not ticked by default.")
+        row.setToolTip(0, "\n".join(notes) or "Ready for your decision: the scanner found this orphaned, and the allow-list permits removing it.")
+        row.setToolTip(1, SCAN_CATEGORY_TITLES.get(entry.category, entry.category))
+        row.setToolTip(2, self.build_clean_row_tooltip(entry))
+        row.setToolTip(3, entry.reason)
+        row.setToolTip(4, CONFIDENCE_MEANING[confidence])
 
     def build_clean_row_tooltip(self, entry: BrokenEntry) -> str:
         """
@@ -5391,8 +6900,7 @@ class RegistryCleanerWindow(QMainWindow):
         for row, entry in self.iter_clean_rows():
             if entry.identity in failed_identities:
                 row.setCheckState(0, Qt.CheckState.Unchecked)
-                row.setText(0, self.build_clean_row_label(entry))          # now carries the ⛔ marker
-                row.setToolTip(0, self.build_clean_row_tooltip(entry))     # ... and explains it
+                self.fill_clean_row(row, entry)                             # now carries the ⛔ marker and explains it
         self.clean_tree.blockSignals(False)
         self.flush_selection_refresh()
 
@@ -5425,12 +6933,25 @@ class RegistryCleanerWindow(QMainWindow):
         return selected
 
     def update_clean_summary(self) -> None:
-        """Refresh the 'N of M selected' line under the results."""
+        """Refresh the Cleanup Summary card and the statistics bar - everything that depends on the list and the ticks."""
         total = len(self.found_entries)
-        if total:
-            self.clean_summary_label.setText(f"{self.count_checked(self.clean_tree)} of {total} entries selected")
+        checked = self.collect_checked_clean_entries() if total else []
+        selected = len(checked)
+        self.stat_labels["findings"].setText(str(total))
+        self.stat_labels["selected"].setText(str(selected))
+        self.stat_labels["categories"].setText(str(len({entry.category for entry in self.found_entries})))
+        self.stat_labels["exclusions"].setText(str(len(self.exclusions)))
+        if not total:
+            self.clean_summary_label.setText("No findings to clean")
+            self.clean_impact_label.setText("Press Analyze to look for broken entries. A scan never changes anything.")
+            return
+        self.clean_summary_label.setText(f"{selected} of {plural(total, 'finding', 'findings')} selected")
+        if selected:
+            categories = len({entry.category for entry in checked})
+            self.clean_impact_label.setText(f"{plural(categories, 'category', 'categories')} affected · {plural(selected, 'undo entry', 'undo entries')} "
+                                            "will be created and verified before anything is deleted · nothing changes until you confirm.")
         else:
-            self.clean_summary_label.setText("No broken entries listed.")
+            self.clean_impact_label.setText("Tick the findings you want to clean. Nothing is selected yet.")
 
     def on_clean_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         """A checkbox in the results changed: schedule ONE refresh of the summary and buttons."""
@@ -5476,12 +6997,17 @@ class RegistryCleanerWindow(QMainWindow):
         self.flush_selection_refresh()
 
     def on_clean_clicked(self) -> None:
-        """Ask for confirmation, then clean the ticked entries (undo backup first)."""
+        """Re-run the safety self-check, show what would be modified, ask for confirmation, then clean (undo backup first)."""
         if not self.require_admin():
             return
-        selected = self.collect_checked_clean_entries()
+        if not self.confirm_safety_before_clean():
+            return
+        # Exclusions can only ever remove findings from this list; they are filtered here once more so that nothing the user
+        # chose to keep can reach the clean engine, whatever state the list is in.
+        selected = [entry for entry in self.collect_checked_clean_entries() if not self.exclusions.is_excluded(entry)]
         if not selected:
             return
+        impact = summarize_clean_impact(selected)
         counts: dict[str, int] = {}
         for entry in selected:
             counts[entry.category] = counts.get(entry.category, 0) + 1
@@ -5492,9 +7018,17 @@ class RegistryCleanerWindow(QMainWindow):
         if network_count:
             network_note = (f"\n\nIncludes {plural(network_count, 'remembered network location', 'remembered network locations')} that you "
                             "ticked yourself. This is Explorer history: no files, shares, mapped drives or saved credentials are touched.")
-        question = (f"Delete {plural(len(selected), 'registry entry', 'registry entries')}?\n\n{breakdown}{network_note}\n\n"
-                    f"Before anything is deleted, an undo backup of exactly these entries is saved to:\n{undo_folder}\n\n"
-                    "If anything looks wrong afterwards, import that file from the Import tab.")
+        at_least = "" if impact.complete else "at least "
+        modify = f"{at_least}{plural(impact.keys, 'key', 'keys')} and {at_least}{plural(impact.values, 'value', 'values')}"
+        question = (f"Delete {plural(len(selected), 'registry entry', 'registry entries')}?\n\n"
+                    f"Items selected: {impact.items}\n"
+                    f"Categories affected: {impact.categories}\n"
+                    f"Undo entries created: {impact.undo_entries}\n"
+                    f"Will modify: {modify}\n\n"
+                    f"{breakdown}{network_note}\n\n"
+                    f"Before anything is deleted, an undo backup of exactly these entries is saved to:\n{undo_folder}\n"
+                    "It is read back and verified first; if that check fails, nothing is changed.\n\n"
+                    "No changes are made until you confirm. If anything looks wrong afterwards, import that file from the Import tab.")
         if not self.ask_yes_no("Confirm cleaning", question):
             return
         self.start_clean(selected)
@@ -5513,8 +7047,14 @@ class RegistryCleanerWindow(QMainWindow):
                 (empty = strict, any problem aborts).
         """
         backup_root = self.backup_root
-        self.start_task(lambda reporter: clean_entries(entries, backup_root, reporter, accepted_identities),
-                        "Clean", self.on_clean_finished,
+
+        def clean_task(reporter: ProgressReporter) -> CleanReport:
+            started = time.perf_counter()
+            report = clean_entries(entries, backup_root, reporter, accepted_identities)
+            report.seconds = time.perf_counter() - started
+            return report
+
+        self.start_task(clean_task, "Clean", self.on_clean_finished,
                         on_undo_failure=lambda error: self.on_clean_undo_check_failed(entries, error))
 
     def on_clean_undo_check_failed(self, attempted: list[BrokenEntry], error: UndoVerificationError) -> None:
@@ -5584,14 +7124,26 @@ class RegistryCleanerWindow(QMainWindow):
         return chose_continue
 
     def on_clean_finished(self, report: CleanReport) -> None:
-        """Show what the clean run did and remove the deleted entries from the list."""
+        """
+        Remove the deleted entries from the list, record the outcome - and say only as much as is honest.
+
+        Nothing to report and no restart needed (Tier 0): no popup at all, just the Cleanup Summary and the status line.
+        Problems (skipped or failed entries) are NEVER silent. A restart note appears only for Tier 1 / Tier 2.
+        """
+        ticks = self.current_tick_map()          # the user's own ticks must survive the rebuild below
         deleted_ids = {id(entry) for entry in report.deleted}
         for entry in report.deleted:
             self.undo_failures.forget(entry)     # gone from the registry: its failure history no longer matters
         self.found_entries = [entry for entry in self.found_entries if id(entry) not in deleted_ids]
-        self.populate_clean_tree()
+        self.all_findings = [entry for entry in self.all_findings if id(entry) not in deleted_ids]
+        self.populate_clean_tree(ticks)
         self.update_clean_summary()
+        self.update_results_view()
         self.refresh_button_states()
+        advice = assess_clean_restart(report)
+        tier = RestartTier.NONE if advice is None else advice.tier
+        log_telemetry("clean", seconds=report.seconds, deleted=len(report.deleted), skipped=len(report.skipped), failed=len(report.failed),
+                      restart_points=0 if advice is None else advice.points, restart_tier=int(tier))
         lines = [f"Deleted: {len(report.deleted)}", f"Skipped: {len(report.skipped)}", f"Failed: {len(report.failed)}"]
         details = ""
         if report.skipped:
@@ -5603,8 +7155,296 @@ class RegistryCleanerWindow(QMainWindow):
         details += format_accepted_undo_note(report.accepted_undo_problems)   # only present after "Continue anyway"
         undo_text = f"\n\nUndo file:\n{report.undo_file}" if report.undo_file else ""
         summary = "\n".join(lines)
-        self.set_status(f"Clean finished: {len(report.deleted)} deleted, {len(report.skipped)} skipped, {len(report.failed)} failed.")
-        self.show_finished_box("Clean finished", f"{summary}{details}{undo_text}", assess_clean_restart(report))
+        outcome = f"{len(report.deleted)} deleted, {len(report.skipped)} skipped, {len(report.failed)} failed"
+        self.last_clean_text = f"Last cleanup: {outcome} in {report.seconds:.1f} s" + (f"\nUndo file: {report.undo_file}" if report.undo_file else "")
+        self.refresh_last_run_label()
+        self.refresh_system_status()             # a restart may have become pending meanwhile
+        self.set_status(f"Clean finished: {outcome}.")
+        has_problems = bool(report.skipped or report.failed or report.accepted_undo_problems)
+        if not has_problems and tier is RestartTier.NONE:
+            return                                                       # Tier 0: no popup, no dialog, no banner, no notification
+        if not has_problems and tier is RestartTier.RECOMMENDED:
+            self.show_notice("Cleanup completed", CLEAN_TIER1_NOTE)      # Tier 1: one calm, optional, non-modal note
+            return
+        self.show_finished_box("Clean finished", f"{summary}{details}{undo_text}", advice, warning=bool(report.failed))
+
+    # ------------------------------------------------------------------ review panel, empty states, status cards
+    def current_tick_map(self) -> dict[EntryIdentity, bool]:
+        """{finding identity: is its row ticked} for every row now in the list - taken before the list is rebuilt."""
+        return {entry.identity: row.checkState(0) == Qt.CheckState.Checked for row, entry in self.iter_clean_rows()}
+
+    def entry_of_row(self, row: QTreeWidgetItem | None) -> BrokenEntry | None:
+        """The finding behind a result row; None for no row or a group heading."""
+        if row is None or row.parent() is None:
+            return None
+        return self.found_entries[int(row.data(0, Qt.ItemDataRole.UserRole))]
+
+    def on_clean_current_changed(self, current: QTreeWidgetItem | None, previous: QTreeWidgetItem | None) -> None:
+        """The highlighted row changed: show that finding in the review panel."""
+        self.show_finding_details(self.entry_of_row(current))
+
+    def show_finding_details(self, entry: BrokenEntry | None) -> None:
+        """Fill the review panel: what the finding is, why it counts as orphaned and what cleaning would remove (read-only)."""
+        if entry is None:
+            self.details_view.setHtml(f'<p style="color:{COLOR_MUTED}">Click a finding to review exactly what it is, why it is '
+                                      "considered orphaned and what cleaning would remove. Reviewing never changes the registry.</p>")
+            return
+        self.details_view.setHtml(self.render_finding_html(entry))
+
+    def render_finding_html(self, entry: BrokenEntry) -> str:
+        """The review panel's content for one finding, as HTML in two columns (every piece of registry text is escaped)."""
+        esc = html.escape
+        confidence = assess_confidence(entry)
+        mono = f"font-family:{UI_MONO_FONT_FAMILY}"
+        value_text = "(the whole key is the finding)" if entry.value_name is None else (entry.value_name or "(Default)")
+        fields = [
+            ("Registry path", f'<span style="{mono}">{esc(entry.full_key_path)}</span>'),
+            ("Value name", esc(value_text)),
+            ("Detected issue", esc(entry.reason)),
+            ("Why it is considered orphaned", esc(explain_why_orphaned(entry))),
+            ("What will be removed", esc(explain_what_is_removed(entry))),
+            ("Risk level", esc(RISK_BY_CATEGORY.get(entry.category, "Review - unknown kind of finding."))),
+            ("Confidence", f'<b style="color:{CONFIDENCE_COLORS[confidence]}">{esc(confidence.value)}</b>'),
+        ]
+        facts = "".join(f'<tr><td width="140" style="color:{COLOR_MUTED}; padding-right:10px" valign="top">{label}</td><td>{value}</td></tr>'
+                        for label, value in fields)
+        preview = build_registry_preview(entry)
+        if preview.exists:
+            current = "<br>".join(esc(line) for line in preview.current_lines)
+            removal = "<br>".join(f"&minus; {esc(line)}" for line in preview.removal_lines)
+            diff = (f'<p style="margin-top:0"><b>Current registry entry</b><br><span style="{mono}">{current}</span></p>'
+                    f'<p><b>Will be deleted</b><br><span style="{mono}; color:{COLOR_ERROR}">{removal}</span></p>')
+        else:
+            diff = ('<p style="margin-top:0"><b>Current registry entry</b><br>It no longer exists (it may have been removed since the scan). '
+                    'Cleaning will skip it.</p>')
+        return (f'<table width="100%" cellspacing="0" cellpadding="3"><tr>'
+                f'<td width="56%" valign="top"><table cellspacing="0" cellpadding="2">{facts}</table></td>'
+                f'<td width="44%" valign="top">{diff}</td></tr></table>')
+
+    def update_results_view(self) -> None:
+        """Show the list when there is something to list, otherwise a clear empty state (never a blank area)."""
+        if self.found_entries:
+            self.results_stack.setCurrentIndex(1)
+            return
+        if self.scan_state == "scanning":
+            icon, title, message = "⏳", "Scanning the registry...", "A scan only reads the registry. Nothing is changed while it runs."
+        elif self.scan_state == "idle":
+            icon, title, message = "🔍", "Click Analyze to begin a scan.", ("Nothing is deleted until you review the list and confirm,\n"
+                                                                               "and an undo backup is saved first.")
+        elif self.hidden_by_exclusions:
+            icon, title = "🚫", "No visible findings."
+            message = (f"{plural(self.hidden_by_exclusions, 'finding in this scan is', 'findings in this scan are')} hidden by your exclusions.\n"
+                       "Open Excluded Items below to review or remove them.")
+        else:
+            icon, title, message = "✅", "No findings detected.", "Your registry appears clean within the supported scan categories."
+        self.empty_icon.setText(icon)
+        self.empty_title.setText(title)
+        self.empty_text.setText(message)
+        self.results_stack.setCurrentIndex(0)
+
+    def set_status_value(self, key: str, text: str, state: str, tooltip: str = "") -> None:
+        """Set one value of the System Status card, coloured by its state ("good", "warn" or "bad")."""
+        label = self.status_values[key]
+        label.setText(text)
+        label.setToolTip(tooltip)
+        self.set_state_property(label, state)
+
+    def refresh_system_status(self) -> None:
+        """Refresh the System Status card (safety, administrator rights, exclusions, pending Windows restart, backup folder)."""
+        report = self.safety_report
+        overall = "bad" if report.has_critical_failure else ("warn" if report.has_warning else "good")
+        self.set_status_value("safety", report.status_text, overall,
+                              "\n".join(f"{'✓' if check.passed else '✗'} {check.title}: {check.detail}" for check in report.checks))
+        self.set_status_value("admin", "Yes" if self.is_admin else "No (read-only)", "good" if self.is_admin else "warn",
+                              "" if self.is_admin else "Without administrator rights you can analyze and preview, but not change anything.")
+        if self.exclusions.load_ok:
+            self.set_status_value("exclusions", f"{len(self.exclusions)} active", "good",
+                                  f"Exclusions file: {self.exclusions.path}")
+        else:
+            self.set_status_value("exclusions", "ignored (file damaged)", "warn", self.exclusions.load_message)
+        pending = detect_pending_restart_reasons()
+        self.set_status_value("restart", "None pending" if not pending else "Pending", "good" if not pending else "warn",
+                              "No restart is waiting." if not pending else "Windows already has a restart pending (not caused by this "
+                              "program):\n" + "\n".join(f"- {reason}" for reason in pending))
+        label = self.status_values["backup"]
+        self.set_status_value("backup", label.fontMetrics().elidedText(self.backup_root, Qt.TextElideMode.ElideMiddle, 320),
+                              "good" if report.passed("backup_folder") else "warn", self.backup_root)
+
+    def refresh_safety_status(self) -> None:
+        """Refresh the safety banner from the self-check report: a tick means the check PASSED, nothing is hard-wired."""
+        report = self.safety_report
+        allowlist_ok = report.passed("allowlist", "delete_guards", "protected_paths")
+        undo_ok = report.passed("undo_system")
+        folder_ok = report.passed("backup_folder")
+        undo_check = next((check for check in report.checks if check.key == "undo_system"), None)
+        if undo_ok and folder_ok:
+            undo_chip = ("✓ Undo Backup Created Before Cleanup", "good")
+        elif undo_ok:
+            undo_chip = ("⚠ Undo backup folder not writable", "warn")
+        elif undo_check is not None and not undo_check.critical:
+            undo_chip = ("⚠ Undo backup could not be self-tested", "warn")
+        else:
+            undo_chip = ("⚠ Undo backup check FAILED", "bad")
+        chips = {
+            "allowlist": ("✓ Allowlist Protected", "good") if allowlist_ok else ("⚠ Allowlist check FAILED", "bad"),
+            "undo": undo_chip,
+            "review": ("✓ Review Before Deletion", "good"),
+        }
+        tips = {
+            "allowlist": "The allow-list lets the cleaner delete ONLY the supported kinds of entries in the supported places and refuses "
+                         "everything else. The start-up self-check ran it on made-up entries to prove it.",
+            "undo": "Before anything is deleted, an undo file with exactly those entries is written, read back and verified. "
+                    "If it does not verify, nothing is changed.",
+            "review": "Nothing is deleted until you have reviewed the list and confirmed.",
+        }
+        for key, (text, state) in chips.items():
+            chip = self.safety_chips[key]
+            chip.setText(text)
+            chip.setToolTip(tips[key])
+            self.set_state_property(chip, state)
+        overall = "bad" if report.has_critical_failure else ("warn" if report.has_warning else "good")
+        self.safety_status_label.setText(f"Safety Status: {report.status_text}")
+        self.safety_status_label.setToolTip("\n".join(f"{'✓' if check.passed else '✗'} {check.title}: {check.detail}" for check in report.checks))
+        self.set_state_property(self.safety_status_label, overall)
+        self.set_state_property(self.safety_banner, overall)
+
+    def refresh_last_run_label(self) -> None:
+        """Show the last scan and the last cleanup (with its undo file) in the Cleanup Summary card."""
+        lines = [line for line in (self.last_scan_text, self.last_clean_text) if line]
+        self.last_run_label.setText("\n".join(lines))
+        self.last_run_label.setVisible(bool(lines))
+
+    def confirm_safety_before_clean(self) -> bool:
+        """Re-run the instant self-checks right before a clean. If a critical one fails, cleaning is disabled (fail closed)."""
+        report = run_safety_self_check(self.backup_root, self.exclusions, full=False)
+        if not report.has_critical_failure:
+            return True
+        kept = tuple(check for check in self.safety_report.checks if check.key not in {fresh.key for fresh in report.checks})
+        self.safety_report = SafetyReport(tuple(report.checks) + kept)
+        self.cleaning_blocked = True
+        self.refresh_safety_status()
+        self.refresh_system_status()
+        self.refresh_button_states()
+        problems = "\n".join(f"  - {check.title}: {check.detail}" for check in report.failures())
+        self.show_error("Cleaning stopped by the safety self-check",
+                        f"The safety self-check failed, so nothing was changed and cleaning is disabled:\n\n{problems}\n\n"
+                        "Analyze and the review panel still work. Please report this problem.")
+        return False
+
+    def show_startup_notices(self) -> None:
+        """Warn (non-modal) about problems found at start-up: a failed safety self-check, a damaged exclusions file."""
+        if self.safety_report.has_critical_failure:
+            problems = "\n".join(f"  - {check.title}: {check.detail}" for check in self.safety_report.failures() if check.critical)
+            self.show_notice("Safety self-check failed",
+                             f"Cleaning is disabled because part of the safety machinery did not pass its self-check:\n\n{problems}\n\n"
+                             "Analyze, the review panel, Backup, Restore and Import preview still work.", warning=True)
+        if not self.exclusions.load_ok:
+            self.show_notice("Exclusions are being ignored",
+                             "Your exclusions could not be loaded safely, so ALL of them are ignored for now: every finding stays visible and "
+                             f"scanning carries on as usual.\n\n{self.exclusions.load_message}\n\nThe file was not changed. If you add a new "
+                             "exclusion, the damaged file is kept aside under a new name first.", warning=True)
+
+    # ------------------------------------------------------------------ exclusions
+    def highlighted_findings(self) -> list[BrokenEntry]:
+        """The findings whose rows are highlighted in the list (this is not the same as ticked: ticks mean 'clean this')."""
+        entries: list[BrokenEntry] = []
+        seen: set[int] = set()
+        for item in self.clean_tree.selectedItems():
+            entry = self.entry_of_row(item)
+            if entry is not None and id(entry) not in seen:
+                seen.add(id(entry))
+                entries.append(entry)
+        return entries
+
+    def apply_exclusion_filter(self) -> None:
+        """
+        Re-apply the exclusions to the last scan WITHOUT scanning again.
+
+        The user's ticks are kept. A finding that comes back (because its exclusion was removed) is never ticked
+        automatically - it returns unticked and has to be ticked deliberately.
+        """
+        previous = self.current_tick_map()                       # before found_entries changes
+        visible, hidden = self.exclusions.partition(self.all_findings)
+        overrides = dict(previous)
+        for entry in visible:
+            if entry.identity not in previous:
+                overrides[entry.identity] = False
+        self.found_entries = visible
+        self.hidden_by_exclusions = len(hidden)
+        self.populate_clean_tree(overrides)
+        self.update_clean_summary()
+        self.update_results_view()
+
+    def after_exclusions_changed(self, message: str) -> None:
+        """Refresh everything that shows exclusions, and tell the user if they could not be stored."""
+        self.refresh_exclusions_panel()
+        self.refresh_system_status()
+        self.update_clean_summary()
+        self.refresh_button_states()
+        self.set_status(message)
+        if not self.exclusions.last_save_ok:
+            self.show_notice("Exclusions not saved", f"{self.exclusions.last_save_message}\n\nThey still apply until you close the program.",
+                             warning=True)
+
+    def on_add_exclusions_clicked(self) -> None:
+        """Hide the highlighted findings from now on (they are still scanned; nothing is deleted)."""
+        entries = self.highlighted_findings()
+        if not entries:
+            return
+        added = self.exclusions.add(entries)
+        self.apply_exclusion_filter()
+        self.after_exclusions_changed(f"Added {plural(added, 'finding', 'findings')} to the exclusions - hidden from the results, nothing was deleted.")
+
+    def refresh_exclusions_panel(self) -> None:
+        """Rebuild the Excluded Items list. No row is selected or ticked: nothing in here is ever pre-selected."""
+        tree = self.exclusions_tree
+        tree.blockSignals(True)
+        tree.clear()
+        self.exclusion_rows = self.exclusions.records()
+        for index, record in enumerate(self.exclusion_rows):
+            icon = CATEGORY_ICONS.get(record.category, "")
+            short_name = CATEGORY_SHORT_NAMES.get(record.category, record.category)
+            item = QTreeWidgetItem(tree, [f"{icon} {short_name}".strip(), record.display_path, record.reason, record.date_excluded])
+            item.setToolTip(0, SCAN_CATEGORY_TITLES.get(record.category, record.category))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)      # no checkbox, ever: nothing here is auto-selected
+            item.setData(0, Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(1, record.display_path)
+            item.setToolTip(2, record.reason)
+        tree.clearSelection()
+        tree.blockSignals(False)
+        self.update_exclusions_toggle_text()
+
+    def update_exclusions_toggle_text(self) -> None:
+        """'▶ Excluded Items (N)' while collapsed, '▼ ...' while expanded."""
+        arrow = "▼" if self.exclusions_toggle.isChecked() else "▶"
+        self.exclusions_toggle.setText(f"{arrow} Excluded Items ({len(self.exclusions)})")
+
+    def on_exclusions_toggled(self, expanded: bool) -> None:
+        """Expand or collapse the Excluded Items section."""
+        self.exclusions_panel.setVisible(expanded)
+        self.update_exclusions_toggle_text()
+
+    def on_remove_selected_exclusions(self) -> None:
+        """Stop hiding the highlighted exclusions. Their findings come back unticked."""
+        records = [self.exclusion_rows[int(item.data(0, Qt.ItemDataRole.UserRole))] for item in self.exclusions_tree.selectedItems()]
+        if not records:
+            return
+        removed = self.exclusions.remove([record.identity for record in records])
+        self.apply_exclusion_filter()
+        self.after_exclusions_changed(f"Removed {plural(removed, 'exclusion', 'exclusions')}. Matching findings are listed again (unticked).")
+
+    def on_remove_all_exclusions(self) -> None:
+        """Empty the exclusion list after asking ('No' is the default)."""
+        count = len(self.exclusions)
+        if not count:
+            return
+        if not self.ask_yes_no("Remove all exclusions",
+                               f"Remove all {plural(count, 'exclusion', 'exclusions')}?\n\nThe findings will be listed again (unticked). "
+                               "Nothing is deleted."):
+            return
+        self.exclusions.clear()
+        self.apply_exclusion_filter()
+        self.after_exclusions_changed(f"Removed all {plural(count, 'exclusion', 'exclusions')}. Matching findings are listed again (unticked).")
 
     # ------------------------------------------------------------------ BACKUP tab
     def on_browse_backup_folder(self) -> None:
@@ -5619,6 +7459,11 @@ class RegistryCleanerWindow(QMainWindow):
         self.settings["backup_dir"] = self.backup_root
         save_settings(self.settings)
         log(f"[FOLDER] Backup folder set to: {self.backup_root}")
+        self.safety_report = run_safety_self_check(self.backup_root, self.exclusions)     # the new folder must be able to hold undo files
+        self.cleaning_blocked = self.safety_report.has_critical_failure
+        self.refresh_safety_status()
+        self.refresh_system_status()
+        self.refresh_button_states()
 
     def open_in_explorer(self, path: str) -> None:
         """Open a file or folder in Windows Explorer / the default app, with friendly errors."""
