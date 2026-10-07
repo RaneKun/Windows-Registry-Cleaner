@@ -183,7 +183,7 @@ The build script handles everything — checking Python version, installing PyIn
 | **Analyze finds nothing** | That's expected on a healthy PC. The scanner is deliberately strict about what counts as "broken". If findings you expected are missing, check the Excluded Items section. |
 | **Some entries get skipped during cleaning** | Normal — files can be locked, or a path became reachable again between scan and clean. The log explains each skip. |
 | **WinSxS-style operations take a long time** | Backups of the whole registry take a few minutes. Let them run; Cancel is available if you need it. |
-| **Antivirus blocked the .exe** | False positive — see the "[Note About Antivirus](https://github.com/RaneKun/Windows-Registry-Cleaner/edit/main/README.md#a-note-about-antivirus)" section above. |
+| **Antivirus blocked the .exe** | False positive — see the "[Note About Antivirus](https://github.com/RaneKun/Windows-Registry-Cleaner?tab=readme-ov-file#a-note-about-antivirus:~:text=A%20Note%20About%20Antivirus)" section above. |
 | **Windows Defender "unknown publisher" warning** | Click "More info" → "Run anyway". The tool isn't code-signed (that costs money), but the source is public. |
 
 ---
