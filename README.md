@@ -46,7 +46,7 @@ This one takes a third path: it **only ever flags an entry when the target file 
 
 ### Download & Run (Recommended)
 
-1. Grab the latest **`Windows Registry Cleaner.exe`** from the [Releases](https://github.com/RaneKun/Windows-Registry-Cleaner/releases) page
+1. Grab the latest **`Windows Registry Cleaner.exe`** from the Releases page
 2. **Right-click → Run as administrator** *(required — writing to the registry needs elevation)*
 3. Choose what to scan on the **Clean** tab and click **Analyze 🔍**
 4. Click any finding to review it, tick what you want removed, and click **Clean Selected 🧹**
