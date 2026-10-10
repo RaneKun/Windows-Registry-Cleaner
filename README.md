@@ -191,7 +191,7 @@ The build script handles everything — checking Python version, installing PyIn
 ## 💬 Feedback & Support
 
 - 🐛 **Found a bug?** [Open an issue](https://github.com/RaneKun/Windows-Registry-Cleaner/issues)
-- 💡 **Have a suggestion?** Start a discussion
+- 💡 **Have a suggestion?** [Start a discussion](https://github.com/RaneKun/Windows-Registry-Cleaner/discussions)
 - ⭐ **Find it useful?** Star the repo — it helps others find it too
 
 ---
